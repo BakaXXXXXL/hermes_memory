@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+backups/
+.backup-hardening/
+*.sqlite3
+*.sqlite3-*
+*.tar.gz
+*.bak
