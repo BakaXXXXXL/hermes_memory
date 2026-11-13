@@ -154,7 +154,10 @@ The directory name itself must match `^[a-z][a-z0-9-]*$`.
 
 `--agent-id` must equal the `agent_identity` the host sends on `initialize`: the
 adapter compares them and raises `agent_identity conflict` when they differ
-(`adapters/hermes/identity.py`). `--agent-workspace` defaults to `hermes`, which
+(`adapters/hermes/identity.py`). An entry of a shared store is the exception:
+every attached profile may send its own name, and the adapter binds the store
+manifest's `agent_id` instead ([shared-store.md](shared-store.md)).
+`--agent-workspace` defaults to `hermes`, which
 is the value the host's memory-provider init contract uses; override it only if
 your host really sends something else, and then pass the same value to plan and
 apply. A mismatch still installs, but capture is refused later because the
@@ -765,6 +768,10 @@ until it comes back empty. Without `--apply` it only lists what it would retire,
 by reference, never by text. A retired claim gets a retracted version and stops
 waiting for evaluation; its sources, its earlier versions and every confirmed
 claim stay as they are.
+
+To remove vectors whose SQLite subject is gone, or history vectors as well with
+`--include-history`, use `vector-cleanup`; it is a dry run unless `--apply` names the manifest a
+dry run wrote. See [vector-cleanup.md](vector-cleanup.md).
 
 An earlier release's capture filter left a one-line summary in place of a tool
 output it withheld ("Tool execution summary ... output_preview=omitted"); stores

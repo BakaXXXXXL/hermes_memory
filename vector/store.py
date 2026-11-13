@@ -438,8 +438,21 @@ class LanceVectorStore(VectorStore):
             arrow = arrow.select(columns)
         return arrow.to_pylist()
 
+    def _projected_rows(self, columns: list[str]) -> list[dict[str, Any]]:
+        """Rows with only ``columns`` read from Lance, never the vector column."""
+        table = self._fresh_table()
+        rows = table.search().select(columns).limit(max(1, int(table.count_rows()))).to_list()
+        return [dict(row) for row in rows]
+
     def list_ids(self) -> list[str]:
-        return sorted(str(row["id"]) for row in self._table_rows(["id"]) if row.get("id"))
+        return sorted(str(row["id"]) for row in self._projected_rows(["id"]) if row.get("id"))
+
+    def list_id_targets(self) -> list[dict[str, str]]:
+        return [
+            {"id": str(row["id"]), "target": str(row.get("target") or "")}
+            for row in self._projected_rows(["id", "target"])
+            if row.get("id")
+        ]
 
     def list_records(self) -> dict[str, dict[str, Any]]:
         """Every row keyed by id; a duplicated id keeps its newest ``updated_at``."""

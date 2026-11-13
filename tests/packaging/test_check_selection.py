@@ -119,6 +119,17 @@ def test_retrieval_selector_keeps_vector_timeout_fallback() -> None:
     assert "tests/contract/test_vector_timeout_fallback.py" in selected
 
 
+def test_retrieval_selector_includes_the_offline_quality_eval() -> None:
+    selected, _ = check.select_tests("retrieval")
+    assert "tests/known_answer/test_retrieval_quality_eval.py" in selected
+
+
+def test_release_and_integration_include_the_offline_quality_eval() -> None:
+    for tier in ("integration", "release"):
+        selected, _ = check.select_tests(tier)
+        assert "tests/known_answer/test_retrieval_quality_eval.py" in selected, tier
+
+
 def test_packaging_includes_script_gate_baseline() -> None:
     packaging, _ = check.select_tests("packaging")
 

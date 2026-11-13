@@ -366,6 +366,20 @@ def _source_retry_reason(tx, ref: str, revision: int, *, current_epoch: int | No
     return _current_source_reason(tx, source)
 
 
+def _consolidate_retry_reason(tx, ref: str, revision: int, *, current_epoch: int | None = None) -> str | None:
+    """A retired generation is history, not input for a new derivation.
+
+    Consolidation reads the source body into a model call.  Suppression keeps
+    that body for explicit history but withdraws it from current use, so a
+    failed consolidation for a suppressed generation must become obsolete
+    instead of being reopened.
+    """
+    source = tx.source(ref, revision)
+    if source is not None and source.suppressed:
+        return "source_revision_stale"
+    return _source_retry_reason(tx, ref, revision, current_epoch=current_epoch)
+
+
 def _projection_retry_reason(tx, ref: str, revision: int, *, current_epoch: int | None = None) -> str | None:
     source = tx.source(ref, revision)
     if source is not None:
@@ -406,7 +420,7 @@ def _purge_retry_reason(tx, ref: str, revision: int, *, current_epoch: int | Non
 #: evaluations are absent on purpose: an evidence combination is evaluated at
 #: most once, and new evidence makes a new row rather than a retry.
 _RETRY_SUBJECT_REASON = {
-    "consolidate": _source_retry_reason,
+    "consolidate": _consolidate_retry_reason,
     "embed": _embed_retry_reason,
     "rebuild_projection": _projection_retry_reason,
     "purge": _purge_retry_reason,
@@ -727,9 +741,16 @@ class WorkItems:
         recovered = 0
         for row in rows:
             oversized = False
+            source = self._tx.source(row["subject_ref"], row["subject_revision"])
+            if source is not None and source.suppressed:
+                conn.execute(
+                    """UPDATE work_items SET state='obsolete',last_error_code='authority_revoked'
+                    WHERE work_id=? AND state='failed'""",
+                    (row["work_id"],),
+                )
+                continue
             try:
                 self._tx.claims.require_live_source(row["subject_ref"], row["subject_revision"])
-                source = self._tx.source(row["subject_ref"], row["subject_revision"])
                 if source is not None and not source.capture_gaps and source.event["capture_state"] == "complete":
                     episode = self._tx.episodes.source_episode(source.ref, source.revision)
                     formatter((source,), episode_ref=episode.ref if episode else None)
@@ -1160,6 +1181,23 @@ class WorkItems:
         """Move one failed row, and its sibling tables when it has any."""
         conn = self._tx._check(write=True)
         reason = "derivation_retry" if automatic else "operator_retry"
+        if work_type == "consolidate":
+            row = conn.execute(
+                "SELECT subject_ref,subject_revision,state FROM work_items WHERE work_id=?", (work_id,)
+            ).fetchone()
+            if row is None or row["state"] != "failed":
+                return False
+            try:
+                revoked = _consolidate_retry_reason(self._tx, row["subject_ref"], row["subject_revision"])
+            except ContractError:
+                revoked = "authority_revoked"
+            if revoked is not None:
+                conn.execute(
+                    """UPDATE work_items SET state='obsolete',last_error_code='authority_revoked'
+                    WHERE work_id=? AND state='failed'""",
+                    (work_id,),
+                )
+                return False
         if work_type == "evaluate_candidate" and not self._tx.candidates.reopen_evaluation(
             work_id, now=now, reason=reason
         ):

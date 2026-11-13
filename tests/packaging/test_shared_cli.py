@@ -13,13 +13,19 @@ import os
 import shlex
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from scope_recall.adapters.clients import remote_client
 from scope_recall.adapters.clients.config import load_shared_client
 from scope_recall.adapters.hermes import HermesIdentityError, bind_hermes_identity
-from scope_recall.adapters.hermes.shared_entries import read_attachment, read_shared_payload
+from scope_recall.adapters.hermes.installation import build_installation_manifest, write_installation_manifest
+from scope_recall.adapters.hermes.shared_entries import (
+    read_attachment,
+    read_shared_payload,
+    write_shared_payload,
+)
 from scope_recall.maintenance import cli, install_dsh, install_workbuddy
 from scope_recall.maintenance.doctor import run_doctor
 from scope_recall.maintenance.install import apply_install, apply_uninstall, plan_install, plan_uninstall
@@ -91,9 +97,39 @@ def _moved_aside(home, routes):
     return archive
 
 
-def _attach(capsys, home, root, archive, entry, name):
-    return _run(
-        capsys,
+def _moved_aside_with_group(tmp_path, name, *, user_id="local", group_user="TEST-friend"):
+    """A home whose own installation granted one friend group, moved aside for attach."""
+    home = (tmp_path / f"TEST-{name}-home").resolve()
+    home.mkdir()
+    source = build_installation_manifest(home, agent_id=AGENT, user_id=user_id, agent_workspace="hermes")
+    owner_scope = source.audience_scopes["owner_private"]
+    group_scope = f"scope:TEST-{name}-group"
+    group_row = dict(
+        source.audiences[0],
+        platform="telegram",
+        user_id=group_user,
+        kind="conversation",
+        chat_type="group",
+        chat_id="TEST-group",
+        allowed_scope_ids=[owner_scope, group_scope],
+        writable_scope_ids=[group_scope],
+        capture_scope_id=group_scope,
+    )
+    source = replace(
+        source,
+        audiences=(*source.audiences, group_row),
+        audience_scopes={**source.audience_scopes, "conversation": group_scope},
+        scope_ids=source.scope_ids | {group_scope},
+    )
+    write_installation_manifest(source)
+    (home / "scope-recall" / "runtime-config.json").write_text(json.dumps(_routes(home)), encoding="utf-8")
+    archive = home / "scope-recall.local-TEST"
+    (home / "scope-recall").rename(archive)
+    return home, archive, owner_scope, group_scope
+
+
+def _attach(capsys, home, root, archive, entry, name, *, store_owner=True):
+    argv = [
         "attach",
         "--host",
         "hermes",
@@ -109,7 +145,10 @@ def _attach(capsys, home, root, archive, entry, name):
         str(archive / "installation.json"),
         "--runtime-config-from",
         str(archive / "runtime-config.json"),
-    )
+    ]
+    if store_owner:
+        argv.append("--store-owner")
+    return _run(capsys, *argv)
 
 
 def _bind(home):
@@ -197,6 +236,296 @@ def test_attach_refuses_a_home_whose_own_store_is_still_in_place(tmp_path, capsy
     assert read_shared_payload(root)["entries"] == []
 
 
+def test_a_default_attach_is_a_non_owner_entry_with_its_own_scope(tmp_path, capsys, root):
+    first, _options = _installed(tmp_path, "tianshu")
+    _moved_aside(first, _routes(first))
+    code, result = _run(
+        capsys,
+        "attach",
+        "--host",
+        "hermes",
+        "--instance-root",
+        str(first),
+        "--root",
+        str(root),
+        "--entry",
+        "tianshu",
+        "--display-name",
+        "天枢",
+    )
+    assert (code, result["status"]) == (0, "attached"), result
+    first_identity = _bind(first)
+    first_scope = first_identity.owner_private_scope_id
+    assert first_scope
+    assert first_identity.runtime_audience.includes_owner_private
+    assert first_identity.runtime_audience.allowed_scope_ids == frozenset({first_scope})
+    assert first_identity.runtime_audience.allowed_scope_ids == first_identity.runtime_audience.writable_scope_ids
+
+    # The installer recognizes the pointer and reuses the attached entry; it does not make a local store.
+    installed = apply_install(plan_install(**_options))
+    assert installed.installation_id == first_identity.binding.installation_id
+    report = run_doctor(host="hermes", instance_root=first, python_executable=Path(sys.executable))
+    assert report.binding_ok and report.database_present
+
+    second, _options = _installed(tmp_path, "tianquan")
+    _moved_aside(second, _routes(second))
+    code, result = _run(
+        capsys,
+        "attach",
+        "--host",
+        "hermes",
+        "--instance-root",
+        str(second),
+        "--root",
+        str(root),
+        "--entry",
+        "tianquan",
+        "--display-name",
+        "天权",
+    )
+    assert (code, result["status"]) == (0, "attached"), result
+    second_identity = _bind(second)
+    assert second_identity.owner_private_scope_id != first_scope
+    assert second_identity.runtime_audience.allowed_scope_ids.isdisjoint(
+        first_identity.runtime_audience.allowed_scope_ids
+    )
+
+
+def test_a_client_takes_grants_from_the_owner_not_a_fresh_entry(tmp_path, capsys, root):
+    owner, _options = _installed(tmp_path, "tianshu")
+    _attach(capsys, owner, root, _moved_aside(owner, _routes(owner)), "tianshu", "天枢")
+    friend, _options = _installed(tmp_path, "friend")
+    _moved_aside(friend, _routes(friend))
+    code, result = _run(
+        capsys,
+        "attach",
+        "--host",
+        "hermes",
+        "--instance-root",
+        str(friend),
+        "--root",
+        str(root),
+        "--entry",
+        "friend",
+        "--display-name",
+        "Friend",
+    )
+    assert (code, result["status"]) == (0, "attached"), result
+    friend_scope = next(entry for entry in read_shared_payload(root)["entries"] if entry["entry_id"] == "friend")[
+        "audience_scopes"
+    ]["owner_private"]
+
+    client = (tmp_path / "TEST-client-home").resolve()
+    client.mkdir()
+    code, result = _attach_client(
+        capsys,
+        root,
+        client,
+        like="all",
+        capture="tianshu",
+        routes=owner / "scope-recall" / "runtime-config.json",
+    )
+    assert (code, result["status"]) == (0, "attached"), result
+    assert friend_scope not in load_shared_client(client, "claude-code").audience.allowed_scope_ids
+
+
+def test_a_client_still_takes_grants_from_an_owner_entry_written_before_the_marker(tmp_path, capsys, root):
+    owner, _options = _installed(tmp_path, "tianshu")
+    _attach(capsys, owner, root, _moved_aside(owner, _routes(owner)), "tianshu", "天枢")
+    payload = read_shared_payload(root)
+    payload["entries"][0].pop("store_owner")
+    write_shared_payload(root, payload)
+
+    client = (tmp_path / "TEST-client-home").resolve()
+    client.mkdir()
+    code, result = _attach_client(capsys, root, client, like="all", capture="tianshu")
+    assert (code, result["status"]) == (0, "attached"), result
+    owner_scope = payload["entries"][0]["audience_scopes"]["owner_private"]
+    assert owner_scope in load_shared_client(client, "claude-code").audience.allowed_scope_ids
+
+
+def test_a_client_does_not_take_a_friends_private_scope_from_an_owner_row(tmp_path, capsys, root):
+    owner, _options = _installed(tmp_path, "tianshu")
+    _attach(capsys, owner, root, _moved_aside(owner, _routes(owner)), "tianshu", "天枢")
+    friend, _options = _installed(tmp_path, "friend")
+    _moved_aside(friend, _routes(friend))
+    code, result = _run(
+        capsys,
+        "attach",
+        "--host",
+        "hermes",
+        "--instance-root",
+        str(friend),
+        "--root",
+        str(root),
+        "--entry",
+        "friend",
+        "--display-name",
+        "Friend",
+    )
+    assert (code, result["status"]) == (0, "attached"), result
+
+    payload = read_shared_payload(root)
+    owner_entry = next(entry for entry in payload["entries"] if entry["entry_id"] == "tianshu")
+    friend_scope = next(entry for entry in payload["entries"] if entry["entry_id"] == "friend")["audience_scopes"][
+        "owner_private"
+    ]
+    owner_row = next(row for row in owner_entry["audiences"] if row["kind"] == "owner_private")
+    owner_row["allowed_scope_ids"] = sorted({*owner_row["allowed_scope_ids"], friend_scope})
+    owner_row["writable_scope_ids"] = sorted({*owner_row["writable_scope_ids"], friend_scope})
+    owner_entry["scope_ids"] = sorted({*owner_entry["scope_ids"], friend_scope})
+    write_shared_payload(root, payload)
+
+    client = (tmp_path / "TEST-client-home").resolve()
+    client.mkdir()
+    code, result = _attach_client(capsys, root, client, like="tianshu", capture="tianshu")
+    assert (code, result["status"]) == (0, "attached"), result
+    assert friend_scope not in load_shared_client(client, "claude-code").audience.allowed_scope_ids
+
+
+def test_a_client_cannot_take_grants_from_a_non_owner_entry(tmp_path, capsys, root):
+    friend, _options = _installed(tmp_path, "friend")
+    _moved_aside(friend, _routes(friend))
+    code, result = _run(
+        capsys,
+        "attach",
+        "--host",
+        "hermes",
+        "--instance-root",
+        str(friend),
+        "--root",
+        str(root),
+        "--entry",
+        "friend",
+        "--display-name",
+        "Friend",
+    )
+    assert (code, result["status"]) == (0, "attached"), result
+
+    client = (tmp_path / "TEST-client-home").resolve()
+    client.mkdir()
+    code, result = _run(
+        capsys,
+        "attach",
+        "--host",
+        "claude-code",
+        "--instance-root",
+        str(client),
+        "--root",
+        str(root),
+        "--entry",
+        "claude-code",
+        "--display-name",
+        "Claude Code",
+        "--grants-like",
+        "friend",
+        "--capture-like",
+        "friend",
+    )
+    assert code == 2 and "has no owner_private grant" in result["error"]
+
+
+def test_grants_from_without_store_owner_keeps_non_owner_grants_and_its_own_private_scope(tmp_path, capsys, root):
+    home, archive, owner_scope, group_scope = _moved_aside_with_group(tmp_path, "friend")
+    code, result = _run(
+        capsys,
+        "attach",
+        "--host",
+        "hermes",
+        "--instance-root",
+        str(home),
+        "--root",
+        str(root),
+        "--entry",
+        "friend",
+        "--display-name",
+        "Friend",
+        "--grants-from",
+        str(archive / "installation.json"),
+    )
+    assert (code, result["status"]) == (0, "attached"), result
+    assert result["store_owner"] is False
+
+    record = next(entry for entry in read_shared_payload(root)["entries"] if entry["entry_id"] == "friend")
+    assert record["store_owner"] is False
+    assert owner_scope not in record["scope_ids"]
+    assert group_scope in record["scope_ids"]
+    friend_scope = record["audience_scopes"]["owner_private"]
+    assert friend_scope != owner_scope and friend_scope in record["scope_ids"]
+    group_row = next(row for row in record["audiences"] if row["kind"] == "conversation")
+    assert group_row["allowed_scope_ids"] == [group_scope]
+    assert group_row["writable_scope_ids"] == [group_scope]
+
+    friend = bind_hermes_identity(
+        "TEST-friend-group",
+        hermes_home=str(home),
+        platform="telegram",
+        user_id="TEST-friend",
+        chat_type="group",
+        chat_id="TEST-group",
+        thread_id="main",
+        agent_identity=AGENT,
+        agent_workspace="hermes",
+        agent_context="primary",
+    )
+    assert friend.runtime_audience.allowed_scope_ids == frozenset({group_scope})
+    assert friend.runtime_audience.writable_scope_ids == frozenset({group_scope})
+    assert owner_scope not in friend.runtime_audience.allowed_scope_ids
+
+    own = bind_hermes_identity(
+        "TEST-friend-cli",
+        hermes_home=str(home),
+        platform="cli",
+        user_id="local",
+        agent_identity=AGENT,
+        agent_workspace="hermes",
+        agent_context="primary",
+    )
+    assert own.runtime_audience.allowed_scope_ids == frozenset({friend_scope})
+    assert owner_scope not in own.runtime_audience.allowed_scope_ids
+
+
+def test_store_owner_is_the_explicit_authorization_to_copy_owner_private(tmp_path, capsys, root):
+    owner, owner_archive, owner_scope, _group_scope = _moved_aside_with_group(tmp_path, "owner")
+    code, result = _attach(capsys, owner, root, owner_archive, "owner", "Owner")
+    assert (code, result["status"], result["store_owner"]) == (0, "attached", True), result
+    owner_record = next(entry for entry in read_shared_payload(root)["entries"] if entry["entry_id"] == "owner")
+    assert owner_record["store_owner"] is True
+    assert owner_scope in owner_record["scope_ids"]
+
+    friend, friend_archive, friend_owner_scope, _ = _moved_aside_with_group(tmp_path, "friend")
+    assert friend_owner_scope == owner_scope, "the defaults give both homes the same owner_private string"
+    code, result = _run(
+        capsys,
+        "attach",
+        "--host",
+        "hermes",
+        "--instance-root",
+        str(friend),
+        "--root",
+        str(root),
+        "--entry",
+        "friend",
+        "--display-name",
+        "Friend",
+        "--grants-from",
+        str(friend_archive / "installation.json"),
+    )
+    assert (code, result["status"], result["store_owner"]) == (0, "attached", False), result
+    friend_record = next(entry for entry in read_shared_payload(root)["entries"] if entry["entry_id"] == "friend")
+    friend_scope = friend_record["audience_scopes"]["owner_private"]
+    assert owner_scope not in friend_record["scope_ids"]
+    assert friend_scope != owner_scope
+
+    client = (tmp_path / "TEST-client-home").resolve()
+    client.mkdir()
+    code, result = _attach_client(capsys, root, client, like="all", capture="owner")
+    assert (code, result["status"]) == (0, "attached"), result
+    audience = load_shared_client(client, "claude-code").audience
+    assert owner_scope in audience.allowed_scope_ids
+    assert friend_scope not in audience.allowed_scope_ids
+
+
 def test_a_second_entry_must_use_the_worker_s_embedding_model(tmp_path, capsys, root):
     first, _options = _installed(tmp_path, "tianshu")
     _attach(capsys, first, root, _moved_aside(first, _routes(first)), "tianshu", "天枢")
@@ -238,6 +567,40 @@ def test_detach_leaves_the_memories_and_the_record(tmp_path, capsys, root):
     assert record["entry_id"] == "tianshu" and record["detached_at"]
     code, listing = _run(capsys, "entries", "--root", str(root))
     assert listing["entries"][0]["pointer_present"] is False and listing["entries"][0]["first_seen"]
+
+
+def test_entries_shows_whether_each_entry_is_the_store_owner(tmp_path, capsys, root):
+    owner, _options = _installed(tmp_path, "tianshu")
+    _attach(capsys, owner, root, _moved_aside(owner, _routes(owner)), "tianshu", "天枢")
+    friend, _options = _installed(tmp_path, "friend")
+    _moved_aside(friend, _routes(friend))
+    code, result = _run(
+        capsys,
+        "attach",
+        "--host",
+        "hermes",
+        "--instance-root",
+        str(friend),
+        "--root",
+        str(root),
+        "--entry",
+        "friend",
+        "--display-name",
+        "Friend",
+    )
+    assert (code, result["status"]) == (0, "attached"), result
+
+    code, listing = _run(capsys, "entries", "--root", str(root))
+    assert [(row["entry_id"], row["store_owner"]) for row in listing["entries"]] == [
+        ("tianshu", True),
+        ("friend", False),
+    ]
+
+    payload = read_shared_payload(root)
+    payload["entries"][0].pop("store_owner")
+    write_shared_payload(root, payload)
+    code, listing = _run(capsys, "entries", "--root", str(root))
+    assert next(row for row in listing["entries"] if row["entry_id"] == "tianshu")["store_owner"] is True
 
 
 def test_a_copied_store_opens_only_after_adopt_and_takes_its_entries_from_new_homes(tmp_path, capsys, root):

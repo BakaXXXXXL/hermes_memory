@@ -9,13 +9,15 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from scope_recall.contracts import InstanceBinding
+from scope_recall.contracts import ENTRY_ID, InstanceBinding
 from scope_recall.core import CoreConfig, MemoryCore
+from scope_recall.core.admission import BASIC_CORE_ADMISSION
 
 from .audiences import (
     EXACT_FIELDS,
     LOCAL_USER_ID,
     HermesIdentityError,
+    assert_scope_kinds,
     audience_entry,
     is_archive_scope,
     normalize_audience_entry,
@@ -105,6 +107,9 @@ class InstallationManifest:
     entry_name: str = ""
     #: The host the entry attached from (``ENTRY_HOSTS``); a local installation is Hermes'.
     entry_host: str = "hermes"
+    #: In a shared store, every entry's owner-private scopes.  A conversation row
+    #: of this entry may not grant one, whoever wrote the store's record.
+    protected_scope_ids: frozenset[str] = frozenset()
 
     def to_binding(self) -> InstanceBinding:
         return InstanceBinding(
@@ -429,6 +434,7 @@ def build_installation_manifest(
         audience_scopes.setdefault(str(row.get("kind") or "conversation"), str(row["capture_scope_id"]))
     if "owner_private" not in audience_scopes:
         raise HermesIdentityError("an explicit owner_private audience is required")
+    assert_scope_kinds(audience_scopes, rows)
 
     mapped = frozenset(scope_id for row in rows for scope_id in row["allowed_scope_ids"])
     source_map, retention = _archive_maps(archive_source_scopes, archive_retention_scopes)
@@ -461,6 +467,79 @@ def build_installation_manifest(
         test_mode=test_mode,
     )
     return approve_local_platforms(manifest, local_platforms, agent_workspace=workspace, logins=owner_logins)
+
+
+def shared_entry_private_scope(entry_id: str) -> str:
+    """A non-owner entry's own private scope, named after the entry.
+
+    A fresh default installation's CLI owner_private scope is the same string
+    for every home that uses the defaults, so a friend who carried one over
+    would share the owner's private memory.  This scope is unique to the entry:
+    only that entry's own route matches it.
+    """
+    if type(entry_id) is not str or not ENTRY_ID.fullmatch(entry_id):
+        raise HermesIdentityError(
+            "entry_id must be 2 to 32 lowercase letters, digits or hyphens, starting with a letter"
+        )
+    return "|".join(
+        [
+            _scope_component("audience", "owner_private"),
+            _scope_component("platform", "cli"),
+            _scope_component("entry", entry_id),
+        ]
+    )
+
+
+def build_shared_entry_manifest(
+    hermes_home: Path,
+    *,
+    agent_id: str,
+    entry_id: str,
+    agent_workspace: str = "default",
+    test_mode: bool = False,
+) -> InstallationManifest:
+    """A home attached without its own installation: a non-owner entry with one private scope of its own.
+
+    A fresh default installation's CLI owner_private scope is the same string for
+    every home that uses the defaults, so carrying it over would make every
+    attached profile read and write the owner's private memory.  This entry gets
+    an owner_private scope named after its entry instead: only its own CLI route
+    matches it, and the record marks it ``store_owner: false`` so the store
+    owner's clients never take grants from it.
+    """
+    home = hermes_home.expanduser().resolve()
+    if not home.is_absolute():
+        raise HermesIdentityError("hermes_home must be absolute")
+    agent = bounded_text(agent_id, field="agent_id")
+    workspace = bounded_text(agent_workspace or "default", field="agent_workspace", required=False) or "default"
+    scope = shared_entry_private_scope(entry_id)
+    row = audience_entry(
+        platform="cli",
+        user_id=LOCAL_USER_ID,
+        chat_type="cli",
+        chat_id=LOCAL_USER_ID,
+        thread_id="main",
+        gateway_session_key="",
+        agent_workspace=workspace,
+        allowed_scope_ids=[scope],
+        writable_scope_ids=[scope],
+        capture_scope_id=scope,
+        kind="owner_private",
+    )
+    manifest = InstallationManifest(
+        schema_version=SCHEMA_VERSION,
+        installation_id=_installation_id(home),
+        agent_id=agent,
+        data_directory=(home / "scope-recall").resolve(),
+        scope_ids=frozenset({scope}),
+        owner_principals=(dict(platform="cli", user_id=LOCAL_USER_ID),),
+        audience_scopes={"owner_private": scope},
+        audiences=(row,),
+        test_mode=bool(test_mode),
+        hermes_home=home,
+    )
+    validate_archive_fields(manifest, present=False, test_mode=test_mode)
+    return manifest
 
 
 def manifest_payload(manifest: InstallationManifest) -> dict[str, Any]:
@@ -515,10 +594,10 @@ def scope_id_list(raw: object) -> frozenset[str]:
     return frozenset(seen)
 
 
-def _audience_scope_map(raw: object) -> dict[str, str]:
+def _audience_scope_map(raw: object, *, require_owner_private: bool = True) -> dict[str, str]:
     if not isinstance(raw, dict) or not raw:
         raise HermesIdentityError("installation manifest audience_scopes invalid")
-    if "owner_private" not in raw:
+    if require_owner_private and "owner_private" not in raw:
         raise HermesIdentityError("installation manifest audience_scopes incomplete")
     for key, value in raw.items():
         if type(key) is not str or not key:
@@ -526,6 +605,13 @@ def _audience_scope_map(raw: object) -> dict[str, str]:
         if type(value) is not str or not value:
             raise HermesIdentityError("audience_scopes value must be nonempty string")
     return dict(raw)
+
+
+def shared_entry_audience_scopes(raw: object) -> dict[str, str]:
+    """A shared entry's kind-to-scope map; a non-owner or read-only entry may declare no kind."""
+    if raw == {}:
+        return {}
+    return _audience_scope_map(raw, require_owner_private=False)
 
 
 def _audience_rows(raw: object) -> tuple[dict[str, Any], ...]:
@@ -697,7 +783,7 @@ def assert_core_binding_matches(core: MemoryCore, binding: InstanceBinding) -> N
 
 def initialize_core(manifest: InstallationManifest, clock: Any | None) -> tuple[InstanceBinding, MemoryCore]:
     binding = manifest.to_binding()
-    core = MemoryCore(CoreConfig(binding), clock=clock)
+    core = MemoryCore(CoreConfig(binding, admission_policy=BASIC_CORE_ADMISSION), clock=clock)
     core.initialize()
     assert_binding_matches_manifest(core.config.binding, manifest)
     return binding, core

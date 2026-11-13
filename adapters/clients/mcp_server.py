@@ -24,6 +24,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field, StrictInt, StrictStr
 from scope_recall.contracts import ContractError, Origin, SourceEvent, TrustedContext, validate_model_request
 from scope_recall.core import CoreConfig, MemoryCore
+from scope_recall.core.admission import BASIC_CORE_ADMISSION
 from scope_recall.core.read_views import DEFAULT_BUDGET_TOKENS, DEFAULT_MAX_ITEMS
 from scope_recall.core.trace import TRACE_GUIDANCE, fence_trace_epoch
 
@@ -207,7 +208,7 @@ class CodexMCPServer:
         elif core is not None:
             self.core = core
         else:
-            self.core = MemoryCore(CoreConfig(config.to_binding()))
+            self.core = MemoryCore(CoreConfig(config.to_binding(), admission_policy=BASIC_CORE_ADMISSION))
         self.session_id = f"mcp-server:{uuid.uuid4().hex}"
         self.context = trusted_context(
             config,

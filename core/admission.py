@@ -30,14 +30,28 @@ class AdmissionPolicy:
     enabled: bool = True
     max_pending_work: int = 2048
     important_reserve: int = 128
+    #: Whether a scheduled source may also be consolidated.  False queues the
+    #: embedding alone for every role, including a person's message; the source,
+    #: its lexical projection and recall stay unchanged.  It governs future
+    #: captures, on-demand scheduling and deferred refills only: consolidation
+    #: work already queued is neither cancelled nor cleaned up, and sources
+    #: admitted while False are not backfilled with a consolidation when it is
+    #: turned back on.
+    consolidation_enabled: bool = True
 
     def __post_init__(self):
         if type(self.enabled) is not bool:
             raise ValueError("admission enabled must be boolean")
+        if type(self.consolidation_enabled) is not bool:
+            raise ValueError("admission consolidation enabled must be boolean")
         if type(self.max_pending_work) is not int or not 2 <= self.max_pending_work <= 100000:
             raise ValueError("max_pending_work must be between 2 and 100000")
         if type(self.important_reserve) is not int or not 0 <= self.important_reserve <= 10000:
             raise ValueError("important_reserve must be between zero and 10000")
+
+
+#: The policy for a Core whose trusted runtime route supplies no consolidation port.
+BASIC_CORE_ADMISSION = AdmissionPolicy(consolidation_enabled=False)
 
 
 @dataclass(frozen=True)
@@ -260,9 +274,13 @@ def _repeated_tool_output(tx, scope_id, text) -> bool:
 TOOL_OUTPUT_WORK_TYPES = frozenset({"embed"})
 
 
-def wanted_work_types(event) -> frozenset[str]:
-    """The derived work a scheduled source is owed: every kind, or an embedding alone for tool output."""
-    return TOOL_OUTPUT_WORK_TYPES if event.get("role") == "tool" else WORK_TYPES
+def wanted_work_types(event, policy=None) -> frozenset[str]:
+    """The derived work a scheduled source is owed: every kind, or an embedding alone for tool output or when
+    consolidation is disabled."""
+    policy = policy or AdmissionPolicy()
+    if event.get("role") == "tool" or not policy.consolidation_enabled:
+        return TOOL_OUTPUT_WORK_TYPES
+    return WORK_TYPES
 
 
 def decide(tx, event, scope_id, policy=None):
@@ -272,7 +290,7 @@ def decide(tx, event, scope_id, policy=None):
         return decision
     if event.get("role") == "tool" and _repeated_tool_output(tx, scope_id, event["content"]):
         return AdmissionDecision("source_only", "tool_output_repeat")
-    wanted = wanted_work_types(event)
+    wanted = wanted_work_types(event, policy)
     kinds = _available_types(tx, scope_id, policy, decision.important, wanted)
     if kinds != wanted:
         return AdmissionDecision("deferred", "queue_capacity", decision.important, kinds)
@@ -337,7 +355,7 @@ def _schedule(tx, clock, ref, revision, policy, *, on_demand=True, fresh=False):
         (ref, revision),
     ).fetchall()
     present = {row[0] for row in existing}
-    missing = wanted_work_types(source.event) - present
+    missing = wanted_work_types(source.event, policy) - present
     if not missing:
         # A tool output deferred before it stopped being owed a consolidation may already hold its
         # embedding; settle its marker, or the refill would select it on every pass.
@@ -454,7 +472,7 @@ def _deferred_page(tx, clock, context, policy, scopes, marks, limit) -> list[tup
     # type: a shared store binds hundreds of scopes, and with 32,000 items
     # queued after an import the 442 separate counts took 90 s of a 120 s
     # pass, so the watchdog ended every pass before it embedded anything.
-    kinds = sorted(WORK_TYPES)
+    kinds = sorted(WORK_TYPES if policy.consolidation_enabled else TOOL_OUTPUT_WORK_TYPES)
     queued = {
         (scope, kind): count
         for scope, kind, count in tx._check().execute(

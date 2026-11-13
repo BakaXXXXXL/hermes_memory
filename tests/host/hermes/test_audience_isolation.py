@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 
 import pytest
-from scope_recall.adapters.hermes import ScopeRecallHermesAdapter, install_hermes_scope_recall
-from scope_recall.adapters.hermes.installation import HermesIdentityError, _build_audience_scope_ids
+from scope_recall.adapters.hermes import (
+    ScopeRecallHermesAdapter,
+    bind_hermes_identity,
+    install_hermes_scope_recall,
+)
+from scope_recall.adapters.hermes.identity import HermesRuntimeScope, resolve_runtime_audience
+from scope_recall.adapters.hermes.installation import (
+    HermesIdentityError,
+    _build_audience_scope_ids,
+    load_installation_manifest,
+)
 
 
 def _row(chat_type: str, chat_id: str, scope_id: str) -> dict[str, object]:
@@ -312,3 +322,207 @@ def test_a_session_key_never_rides_on_the_cli_route(installed_core, initialize_k
             assert bool(provider._identity.runtime_audience.allowed_scope_ids) is granted, key
         finally:
             provider.shutdown()
+
+
+def test_a_conversation_row_may_not_carry_the_owner_private_scope(hermes_home, initialize_kwargs):
+    workspace = initialize_kwargs["agent_workspace"]
+    owner = _owner_row(platform="telegram", user_id=initialize_kwargs["user_id"], workspace=workspace)
+    owner_scope = owner["capture_scope_id"]
+    group = dict(
+        _row("group", "TEST-group", owner_scope),
+        platform="telegram",
+        user_id="TEST-friend",
+        agent_workspace=workspace,
+    )
+    with pytest.raises(HermesIdentityError, match="owner_private"):
+        install_hermes_scope_recall(
+            hermes_home,
+            agent_id=initialize_kwargs["agent_identity"],
+            platform="telegram",
+            user_id=initialize_kwargs["user_id"],
+            agent_workspace=workspace,
+            audiences=[owner, group],
+            test_mode=False,
+        )
+
+
+def test_a_friends_dm_row_declared_owner_private_grants_nothing(hermes_home, initialize_kwargs):
+    workspace = initialize_kwargs["agent_workspace"]
+    friend_scope = "scope:TEST-friend-private"
+    friend = dict(
+        _row("dm", "TEST-friend", friend_scope),
+        platform="telegram",
+        user_id="TEST-friend",
+        agent_workspace=workspace,
+        kind="owner_private",
+    )
+    install_hermes_scope_recall(
+        hermes_home,
+        agent_id=initialize_kwargs["agent_identity"],
+        platform="telegram",
+        user_id=initialize_kwargs["user_id"],
+        agent_workspace=workspace,
+        audiences=[
+            _owner_row(platform="telegram", user_id=initialize_kwargs["user_id"], workspace=workspace),
+            friend,
+        ],
+        test_mode=False,
+    )
+    identity = bind_hermes_identity(
+        "TEST-friend-session",
+        **dict(
+            initialize_kwargs,
+            platform="telegram",
+            user_id="TEST-friend",
+            chat_type="dm",
+            chat_id="TEST-friend",
+            thread_id="main",
+        ),
+    )
+    assert identity.runtime_audience.allowed_scope_ids == frozenset()
+    assert identity.runtime_audience.writable_scope_ids == frozenset()
+    assert "capability_gap:owner_private_not_owner" in identity.runtime_audience.capability_gaps
+
+
+def test_a_group_row_carrying_an_owner_private_scope_grants_only_its_own(hermes_home, initialize_kwargs):
+    workspace = initialize_kwargs["agent_workspace"]
+    install_hermes_scope_recall(
+        hermes_home,
+        agent_id=initialize_kwargs["agent_identity"],
+        platform="telegram",
+        user_id=initialize_kwargs["user_id"],
+        agent_workspace=workspace,
+        audiences=[_owner_row(platform="telegram", user_id=initialize_kwargs["user_id"], workspace=workspace)],
+        test_mode=False,
+    )
+    manifest = load_installation_manifest(hermes_home)
+    owner_row = manifest.audiences[0]
+    owner_scope = manifest.audience_scopes["owner_private"]
+    group_scope = "scope:TEST-group"
+    bad_group = dict(
+        owner_row,
+        kind="conversation",
+        chat_type="group",
+        chat_id="TEST-group",
+        allowed_scope_ids=[owner_scope, group_scope],
+        writable_scope_ids=[owner_scope, group_scope],
+        capture_scope_id=owner_scope,
+    )
+    old = replace(
+        manifest,
+        audiences=(owner_row, bad_group),
+        audience_scopes={"owner_private": owner_scope},
+        scope_ids=frozenset({owner_scope, group_scope}),
+    )
+    scope = HermesRuntimeScope(
+        platform="telegram",
+        user_id=owner_row["user_id"],
+        chat_type="group",
+        chat_id="TEST-group",
+        thread_id="main",
+        agent_identity=manifest.agent_id,
+        agent_workspace=workspace,
+        agent_context="primary",
+    )
+    audience = resolve_runtime_audience(old, scope)
+    assert audience.allowed_scope_ids == frozenset({group_scope})
+    assert audience.writable_scope_ids == frozenset({group_scope})
+    assert audience.capture_scope_id is None
+    assert owner_scope not in audience.allowed_scope_ids
+    assert "capability_gap:owner_private_scope_denied" in audience.capability_gaps
+
+
+def test_a_store_protected_scope_is_not_granted_by_a_conversation_row(hermes_home, initialize_kwargs):
+    workspace = initialize_kwargs["agent_workspace"]
+    install_hermes_scope_recall(
+        hermes_home,
+        agent_id=initialize_kwargs["agent_identity"],
+        platform="telegram",
+        user_id=initialize_kwargs["user_id"],
+        agent_workspace=workspace,
+        audiences=[_owner_row(platform="telegram", user_id=initialize_kwargs["user_id"], workspace=workspace)],
+        test_mode=False,
+    )
+    manifest = load_installation_manifest(hermes_home)
+    owner_scope = manifest.audience_scopes["owner_private"]
+    friend_scope = "scope:TEST-friend"
+    friend_row = dict(
+        manifest.audiences[0],
+        kind="conversation",
+        chat_type="group",
+        chat_id="TEST-group",
+        user_id="TEST-friend",
+        allowed_scope_ids=[owner_scope, friend_scope],
+        writable_scope_ids=[owner_scope, friend_scope],
+        capture_scope_id=owner_scope,
+    )
+    view = replace(
+        manifest,
+        audiences=(friend_row,),
+        audience_scopes={"conversation": friend_scope},
+        scope_ids=frozenset({owner_scope, friend_scope}),
+        protected_scope_ids=frozenset({owner_scope}),
+    )
+    scope = HermesRuntimeScope(
+        platform="telegram",
+        user_id="TEST-friend",
+        chat_type="group",
+        chat_id="TEST-group",
+        thread_id="main",
+        agent_identity=manifest.agent_id,
+        agent_workspace=workspace,
+        agent_context="primary",
+    )
+    audience = resolve_runtime_audience(view, scope)
+    assert audience.allowed_scope_ids == frozenset({friend_scope})
+    assert owner_scope not in audience.allowed_scope_ids
+    assert "capability_gap:owner_private_scope_denied" in audience.capability_gaps
+
+
+def test_dm_private_and_direct_are_one_route_without_widening(hermes_home, initialize_kwargs):
+    workspace = initialize_kwargs["agent_workspace"]
+    friend_scope = "scope:TEST-friend"
+    install_hermes_scope_recall(
+        hermes_home,
+        agent_id=initialize_kwargs["agent_identity"],
+        platform="telegram",
+        user_id=initialize_kwargs["user_id"],
+        agent_workspace=workspace,
+        audiences=[
+            _owner_row(platform="telegram", user_id=initialize_kwargs["user_id"], workspace=workspace),
+            dict(
+                _row("dm", "TEST-friend", friend_scope),
+                platform="telegram",
+                user_id="TEST-friend",
+                agent_workspace=workspace,
+            ),
+        ],
+        test_mode=False,
+    )
+    owner = bind_hermes_identity(
+        "TEST-owner-session",
+        **dict(
+            initialize_kwargs,
+            platform="telegram",
+            user_id=initialize_kwargs["user_id"],
+            chat_type="dm",
+            chat_id=initialize_kwargs["user_id"],
+            thread_id="main",
+        ),
+    )
+    friend = bind_hermes_identity(
+        "TEST-friend-session",
+        **dict(
+            initialize_kwargs,
+            platform="telegram",
+            user_id="TEST-friend",
+            chat_type="direct",
+            chat_id="TEST-friend",
+            thread_id="main",
+        ),
+    )
+    assert owner.runtime_audience.includes_owner_private
+    assert owner.owner_private_scope_id in owner.runtime_audience.allowed_scope_ids
+    assert friend.runtime_audience.allowed_scope_ids == frozenset({friend_scope})
+    assert not friend.runtime_audience.includes_owner_private
+    assert owner.owner_private_scope_id not in friend.runtime_audience.allowed_scope_ids

@@ -11,18 +11,23 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import closing
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 from scope_recall.adapters.hermes import HermesIdentityError, ScopeRecallHermesAdapter, bind_hermes_identity
-from scope_recall.adapters.hermes.identity import switch_hermes_identity
+from scope_recall.adapters.hermes.identity import principal_ref, switch_hermes_identity
 from scope_recall.adapters.hermes.installation import build_installation_manifest, write_installation_manifest
 from scope_recall.adapters.hermes.shared_entries import (
     attach_shared_entry,
+    attach_shared_record,
+    attachment_path,
     load_binding_for_home,
     new_shared_payload,
     read_shared_payload,
+    shared_entry_record,
+    store_owner_private_scopes,
     write_shared_payload,
 )
 
@@ -63,8 +68,8 @@ def root(tmp_path):
 def entries(tmp_path, root):
     tianshu = _home(tmp_path, "tianshu")
     tianquan = _home(tmp_path, "tianquan")
-    attach_shared_entry(root, tianshu, entry_id="tianshu", display_name="天枢", now=NOW)
-    attach_shared_entry(root, tianquan, entry_id="tianquan", display_name="天权", now=NOW)
+    attach_shared_entry(root, tianshu, entry_id="tianshu", display_name="天枢", now=NOW, store_owner=True)
+    attach_shared_entry(root, tianquan, entry_id="tianquan", display_name="天权", now=NOW, store_owner=True)
     return tianshu.hermes_home, tianquan.hermes_home
 
 
@@ -108,6 +113,29 @@ def test_an_attached_home_binds_the_shared_store_as_its_own_entry(root, entries)
     context = identity.trusted_context()
     assert (context.session_id, context.entry_id) == ("tianshu:TEST-session-1", "tianshu")
     assert not (tianshu / "scope-recall" / "installation.json").exists()
+
+
+def test_a_shared_entry_binds_the_stores_agent_id_not_the_hosts_profile_name(tmp_path):
+    """Every Hermes profile attached to one shared store sends its own name on initialize; the store's
+    manifest names the agent the core binds, so a profile name is not a conflict."""
+    store = tmp_path / "TEST-shared-default"
+    write_shared_payload(store, new_shared_payload(store, agent_id="default"))
+    home = tmp_path / "TEST-profile-home"
+    home.mkdir()
+    source = build_installation_manifest(home, agent_id="default", user_id=OWNER, agent_workspace="hermes")
+    attach_shared_entry(store, source, entry_id="xiaokui", display_name="xiaokui", now=NOW, store_owner=True)
+
+    identity = bind_hermes_identity(
+        "TEST-session-1", **_kwargs(home, agent_identity="xiaokui", agent_workspace="hermes")
+    )
+
+    assert identity.binding.agent_id == identity.scope.agent_identity == "default"
+    assert identity.runtime_audience.allowed_scope_ids
+    assert identity.source_principal("assistant_visible").principal_ref == principal_ref(
+        "assistant", identity.binding.installation_id, "default", "xiaokui"
+    )
+    switched = switch_hermes_identity(identity, "TEST-session-2", agent_identity="xiaokui")
+    assert switched.scope.agent_identity == "default"
 
 
 def test_what_one_entry_is_told_another_recalls_marked_with_where_it_came_in(root, entries):
@@ -216,7 +244,7 @@ def test_an_entry_attached_later_leaves_a_running_one_bound_as_it_was(tmp_path, 
     try:
         before = running._identity.binding
         tianxuan = _home(tmp_path, "tianxuan", platform="telegram", conversation_key="TEST-group-9")
-        attach_shared_entry(root, tianxuan, entry_id="tianxuan", display_name="天璇", now=NOW)
+        attach_shared_entry(root, tianxuan, entry_id="tianxuan", display_name="天璇", now=NOW, store_owner=True)
         assert set(read_shared_payload(root)["scope_ids"]) > before.scope_ids
 
         running.on_session_switch("TEST-session-2")
@@ -561,3 +589,316 @@ def test_tool_outputs_retention_would_expire_at_once_are_not_queued_for_embeddin
         )
     }
     assert kept and "tool" not in kept and "test-deploy" in kept, "a placeholder keeps its error text alone"
+
+
+def test_a_default_attach_gets_its_own_scope_not_the_owners_cli_scope(tmp_path, root):
+    from scope_recall.maintenance.shared import attach
+
+    owner_home = tmp_path / "TEST-owner-home"
+    owner_home.mkdir()
+    owner_source = build_installation_manifest(owner_home, agent_id=AGENT, user_id=OWNER, agent_workspace=WORKSPACE)
+    attach_shared_entry(root, owner_source, entry_id="owner", display_name="Owner", now=NOW, store_owner=True)
+    owner_scope = owner_source.audience_scopes["owner_private"]
+
+    friend_home = tmp_path / "TEST-friend-home"
+    friend_home.mkdir()
+    result = attach(
+        host="hermes",
+        instance_root=friend_home,
+        root=root,
+        entry_id="friend",
+        display_name="Friend",
+        now=NOW,
+    )
+    assert result["status"] == "attached"
+    friend = next(entry for entry in read_shared_payload(root)["entries"] if entry["entry_id"] == "friend")
+    friend_scope = friend["audience_scopes"]["owner_private"]
+    assert friend_scope != owner_scope
+    assert friend.get("store_owner") is False
+    assert owner_scope not in friend["scope_ids"]
+
+    identity = bind_hermes_identity("TEST-session-1", **_kwargs(friend_home, user_id="local", agent_workspace="hermes"))
+    assert identity.owner_private_scope_id == friend_scope
+    assert identity.runtime_audience.includes_owner_private
+    assert identity.runtime_audience.allowed_scope_ids == frozenset(friend["scope_ids"]) == frozenset({friend_scope})
+    assert owner_scope not in identity.runtime_audience.allowed_scope_ids
+
+    owner_identity = bind_hermes_identity("TEST-session-2", **_kwargs(owner_home))
+    assert owner_identity.owner_private_scope_id == owner_scope
+    assert owner_scope in owner_identity.runtime_audience.allowed_scope_ids
+    assert identity.runtime_audience.allowed_scope_ids.isdisjoint(owner_identity.runtime_audience.allowed_scope_ids)
+
+
+def test_attach_refuses_a_second_entry_that_would_take_the_owner_private_scope(tmp_path, root):
+    owner_home = tmp_path / "TEST-owner-home"
+    owner_home.mkdir()
+    owner_source = build_installation_manifest(owner_home, agent_id=AGENT, user_id=OWNER, agent_workspace=WORKSPACE)
+    attach_shared_entry(root, owner_source, entry_id="owner", display_name="Owner", now=NOW, store_owner=True)
+
+    friend_home = tmp_path / "TEST-friend-home"
+    friend_home.mkdir()
+    friend_source = build_installation_manifest(friend_home, agent_id=AGENT, user_id=OWNER, agent_workspace=WORKSPACE)
+    friend_record = shared_entry_record(
+        friend_source, entry_id="friend", display_name="Friend", attached_at=NOW, store_owner=True
+    )
+    with pytest.raises(HermesIdentityError, match="owner_private scope conflict"):
+        attach_shared_record(root, friend_record, now=NOW, reject_owner_private_conflict=True)
+    assert [entry["entry_id"] for entry in read_shared_payload(root)["entries"]] == ["owner"]
+    assert not (friend_home / "scope-recall" / "attachment.json").exists()
+
+
+def test_a_carried_installation_group_row_loses_the_owner_private_scope(tmp_path, root):
+    home = _home(tmp_path, "owner")
+    owner_scope = home.audience_scopes["owner_private"]
+    group_scope = "scope:TEST-group"
+    group_row = dict(
+        home.audiences[0],
+        platform="telegram",
+        kind="conversation",
+        chat_type="group",
+        chat_id="TEST-group",
+        allowed_scope_ids=[owner_scope, group_scope],
+        writable_scope_ids=[owner_scope, group_scope],
+        capture_scope_id=owner_scope,
+    )
+    source = replace(
+        home,
+        audiences=(*home.audiences, group_row),
+        scope_ids=home.scope_ids | {group_scope},
+        audience_scopes={**home.audience_scopes, "conversation": group_scope},
+    )
+    attach_shared_entry(root, source, entry_id="owner", display_name="Owner", now=NOW, store_owner=True)
+
+    record = next(entry for entry in read_shared_payload(root)["entries"] if entry["entry_id"] == "owner")
+    carried = next(row for row in record["audiences"] if row["kind"] == "conversation")
+    assert carried["allowed_scope_ids"] == [group_scope]
+    assert carried["writable_scope_ids"] == []
+    assert carried["capture_scope_id"] == ""
+
+    identity = bind_hermes_identity(
+        "TEST-session-1",
+        **_kwargs(
+            home.hermes_home,
+            platform="telegram",
+            user_id=OWNER,
+            chat_type="group",
+            chat_id="TEST-group",
+            thread_id="main",
+        ),
+    )
+    assert identity.runtime_audience.allowed_scope_ids == frozenset({group_scope})
+    assert identity.runtime_audience.writable_scope_ids == frozenset()
+    assert owner_scope not in identity.runtime_audience.allowed_scope_ids
+
+
+def _legacy_friend_entry(tmp_path, root, owner_scope):
+    """A friend attached normally, then written the way an older release did: its group row names the owner's scope."""
+    friend_home = tmp_path / "TEST-friend-home"
+    friend_home.mkdir()
+    friend_source = build_installation_manifest(friend_home, agent_id=AGENT, user_id=OWNER, agent_workspace=WORKSPACE)
+    group_scope = "scope:TEST-legacy-friend-group"
+    group_row = dict(
+        friend_source.audiences[0],
+        platform="telegram",
+        user_id="TEST-friend",
+        kind="conversation",
+        chat_type="group",
+        chat_id="TEST-group",
+        allowed_scope_ids=[group_scope],
+        writable_scope_ids=[group_scope],
+        capture_scope_id=group_scope,
+    )
+    friend_source = replace(
+        friend_source,
+        audiences=(*friend_source.audiences, group_row),
+        audience_scopes={**friend_source.audience_scopes, "conversation": group_scope},
+        scope_ids=friend_source.scope_ids | {group_scope},
+    )
+    attach_shared_entry(root, friend_source, entry_id="friend", display_name="Friend", now=NOW, store_owner=False)
+
+    payload = read_shared_payload(root)
+    record = next(entry for entry in payload["entries"] if entry["entry_id"] == "friend")
+    record = {
+        **record,
+        "audiences": [
+            dict(
+                row,
+                allowed_scope_ids=sorted({*row["allowed_scope_ids"], owner_scope}),
+                writable_scope_ids=sorted({*row["writable_scope_ids"], owner_scope}),
+            )
+            if row["kind"] == "conversation"
+            else row
+            for row in record["audiences"]
+        ],
+        "scope_ids": sorted({*record["scope_ids"], owner_scope}),
+    }
+    write_shared_payload(
+        root,
+        {
+            **payload,
+            "entries": [record if entry["entry_id"] == "friend" else entry for entry in payload["entries"]],
+            "scope_ids": sorted({*payload["scope_ids"], *record["scope_ids"]}),
+        },
+    )
+    return friend_home, group_scope
+
+
+def test_a_legacy_friend_entry_cannot_bind_the_owners_private_scope(tmp_path, root):
+    """A record written before attach narrowed every row still cannot grant the owner's memory at bind time."""
+    owner_home = tmp_path / "TEST-owner-home"
+    owner_home.mkdir()
+    owner_source = build_installation_manifest(owner_home, agent_id=AGENT, user_id=OWNER, agent_workspace=WORKSPACE)
+    attach_shared_entry(root, owner_source, entry_id="owner", display_name="Owner", now=NOW, store_owner=True)
+    owner_scope = owner_source.audience_scopes["owner_private"]
+    friend_home, group_scope = _legacy_friend_entry(tmp_path, root, owner_scope)
+
+    identity = bind_hermes_identity(
+        "TEST-legacy-friend",
+        **_kwargs(
+            friend_home,
+            platform="telegram",
+            user_id="TEST-friend",
+            chat_type="group",
+            chat_id="TEST-group",
+            thread_id="main",
+        ),
+    )
+    assert identity.runtime_audience.allowed_scope_ids == frozenset({group_scope})
+    assert owner_scope not in identity.runtime_audience.allowed_scope_ids
+    assert "capability_gap:owner_private_scope_denied" in identity.runtime_audience.capability_gaps
+
+
+def test_downgrading_an_owner_renarrows_a_legacy_friends_owner_scope(tmp_path, root):
+    """Replacing the owner must keep its old private scope protected and clean every row that names it."""
+    owner_home = tmp_path / "TEST-owner-home"
+    owner_home.mkdir()
+    owner_source = build_installation_manifest(owner_home, agent_id=AGENT, user_id=OWNER, agent_workspace=WORKSPACE)
+    attach_shared_entry(root, owner_source, entry_id="owner", display_name="Owner", now=NOW, store_owner=True)
+    owner_scope = owner_source.audience_scopes["owner_private"]
+    friend_home, group_scope = _legacy_friend_entry(tmp_path, root, owner_scope)
+
+    assert owner_scope in store_owner_private_scopes(read_shared_payload(root), exclude_entry="owner")
+
+    attach_shared_entry(root, owner_source, entry_id="owner", display_name="Owner", now=NOW, store_owner=False)
+
+    payload = read_shared_payload(root)
+    owner = next(entry for entry in payload["entries"] if entry["entry_id"] == "owner")
+    assert owner["store_owner"] is False and owner_scope not in owner["scope_ids"]
+    friend = next(entry for entry in payload["entries"] if entry["entry_id"] == "friend")
+    assert owner_scope not in friend["scope_ids"]
+    assert all(owner_scope not in row["allowed_scope_ids"] for row in friend["audiences"])
+
+    owner_identity = bind_hermes_identity("TEST-owner-after-downgrade", **_kwargs(owner_home))
+    assert owner_identity.runtime_audience.allowed_scope_ids == frozenset(owner["scope_ids"])
+    assert owner_scope not in owner_identity.runtime_audience.allowed_scope_ids
+
+    identity = bind_hermes_identity(
+        "TEST-legacy-friend",
+        **_kwargs(
+            friend_home,
+            platform="telegram",
+            user_id="TEST-friend",
+            chat_type="group",
+            chat_id="TEST-group",
+            thread_id="main",
+        ),
+    )
+    assert identity.runtime_audience.allowed_scope_ids == frozenset({group_scope})
+    assert owner_scope not in identity.runtime_audience.allowed_scope_ids
+
+
+def test_downgrading_an_owner_refuses_when_a_legacy_friend_would_lose_every_grant(tmp_path, root):
+    """If cleaning a row would leave another entry with no grant, nothing is written."""
+    owner_home = tmp_path / "TEST-owner-home"
+    owner_home.mkdir()
+    owner_source = build_installation_manifest(owner_home, agent_id=AGENT, user_id=OWNER, agent_workspace=WORKSPACE)
+    attach_shared_entry(root, owner_source, entry_id="owner", display_name="Owner", now=NOW, store_owner=True)
+    owner_scope = owner_source.audience_scopes["owner_private"]
+
+    friend_home = tmp_path / "TEST-friend-home"
+    friend_home.mkdir()
+    friend_source = build_installation_manifest(friend_home, agent_id=AGENT, user_id=OWNER, agent_workspace=WORKSPACE)
+    payload = read_shared_payload(root)
+    friend = shared_entry_record(
+        friend_source,
+        entry_id="friend",
+        display_name="Friend",
+        attached_at=NOW,
+        store=payload,
+        protected_scope_ids=store_owner_private_scopes(payload),
+        store_owner=False,
+    )
+    legacy_row = dict(
+        friend["audiences"][0],
+        platform="telegram",
+        user_id="TEST-friend",
+        kind="conversation",
+        chat_type="group",
+        chat_id="TEST-group",
+        allowed_scope_ids=[owner_scope],
+        writable_scope_ids=[],
+        capture_scope_id="",
+    )
+    friend = {**friend, "audiences": [legacy_row], "audience_scopes": {}, "scope_ids": [owner_scope]}
+    write_shared_payload(
+        root,
+        {
+            **payload,
+            "entries": [*payload["entries"], friend],
+            "scope_ids": sorted({*payload["scope_ids"], owner_scope}),
+        },
+    )
+    before = read_shared_payload(root)
+
+    with pytest.raises(HermesIdentityError, match="cannot safely narrow entry friend"):
+        attach_shared_entry(root, owner_source, entry_id="owner", display_name="Owner", now=NOW, store_owner=False)
+
+    assert read_shared_payload(root) == before
+    owner = next(entry for entry in before["entries"] if entry["entry_id"] == "owner")
+    assert owner["store_owner"] is True and owner_scope in owner["scope_ids"]
+
+
+def test_an_old_tool_output_does_not_make_its_fresh_copy_a_repeat_at_import(root, entries):
+    """The window expires the old copy; the fresh copy must still be embedded for the content's vector."""
+    from scope_recall.maintenance.shared_import import _Names, import_entry
+    from v11_support import source_event
+
+    tianshu, _tianquan = entries
+    scope = _scope(tianshu)
+    core, context, (said,), old = _old_store(tianshu, scope, "TEST 一句用户说过的话。")
+    tool = replace(context, actor_origin="tool_observation")
+    content = "TEST 工具输出：目录里有三个文件。"
+    older, fresh = [
+        core.record_event(
+            tool,
+            source_event(
+                source_event_key=f"legacy:tools:{index}", origin="tool_observation", role="tool", content=content
+            ),
+            scope_id=scope,
+            remaining_seconds=10,
+        ).event_refs[0]
+        for index in range(2)
+    ]
+    with closing(sqlite3.connect(old / "memory.sqlite3")) as db:
+        db.executemany(
+            "UPDATE source_events SET persisted_at=? WHERE event_id=?",
+            [("2026-01-01T00:00:00Z", older.ref), (NOW, fresh.ref)],
+        )
+        # The history an earlier release left: both copies embedded, whatever the intake gate says.
+        for ref in (said, older, fresh):
+            db.execute(
+                """INSERT INTO work_items(work_type,subject_ref,subject_revision,scope_id,state,available_at)
+                          VALUES ('embed',?,?,?,'done','2026-01-01T00:00:00Z')
+                          ON CONFLICT(work_type,subject_ref,subject_revision) DO UPDATE SET state='done'""",
+                (ref.ref, ref.revision, scope),
+            )
+        db.commit()
+
+    result = import_entry(root=root, entry_id="tianshu", source=old, now=NOW)
+    names = _Names("tianshu", frozenset({said.ref, older.ref, fresh.ref}))
+    assert result["counts"]["embeddings_retention_would_expire"] == 0, result["counts"]
+    assert _query(root, "SELECT count(*) FROM expired_vectors") == [(0,)]
+    queued = {
+        row[0] for row in _query(root, "SELECT subject_ref FROM work_items WHERE work_type='embed' AND state='pending'")
+    }
+    assert {names.event(older.ref), names.event(fresh.ref)} <= queued

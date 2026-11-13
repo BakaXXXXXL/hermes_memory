@@ -144,11 +144,13 @@ SUITES = {
         "tests/contract/test_a_paused_wake_lets_go.py",
         "tests/contract/test_a_pass_that_ends_hands_back_its_group.py",
         "tests/contract/test_settle_window_wake.py",
+        "tests/contract/test_source_revision_lifecycle.py",
     ],
     "storage": [
         "tests/contract/test_storage.py",
         "tests/contract/test_shared_store.py",
         "tests/contract/test_embedding_respace.py",
+        "tests/contract/test_vector_cleanup.py",
         "tests/known_answer/test_recall_invariants_check.py",
     ],
     "capture": ["tests/contract/test_capture.py", "tests/contract/test_capture_row_crossings.py"],
@@ -171,6 +173,7 @@ SUITES = {
         "tests/contract/test_auto_query_echo.py",
         "tests/contract/test_vector_retention.py",
         "tests/contract/test_recall_scope.py",
+        "tests/known_answer/test_retrieval_quality_eval.py",
         "tests/contract/test_withheld_outputs_unindexed.py",
         "tests/contract/test_recall_row_crossings.py",
         "tests/contract/test_owner_view.py",
@@ -288,7 +291,9 @@ SAFETY_BASELINE = [
     "tests/contract/test_protocol.py",
     "tests/contract/test_storage.py",
     "tests/contract/test_deletion.py",
+    "tests/contract/test_source_revision_lifecycle.py",
     "tests/contract/test_recall_admission.py",
+    "tests/contract/test_vector_cleanup.py",
 ]
 
 
@@ -319,8 +324,10 @@ I_SAFETY_MATRIX = {
     ],
     "I07": [
         "tests/contract/test_deletion.py",
+        "tests/contract/test_source_revision_lifecycle.py",
         "tests/contract/test_worker.py",
         "tests/contract/test_lance_embed_fence.py",
+        "tests/contract/test_vector_cleanup.py",
     ],
     "I08": [
         "tests/contract/test_retrieval_pipeline.py",
@@ -413,9 +420,11 @@ CORE_RELEASE_CONTRACTS += [
     "tests/contract/test_evidence_question.py",
     "tests/contract/test_failure_retry.py",
     "tests/contract/test_recall_probe_set.py",
+    "tests/known_answer/test_retrieval_quality_eval.py",
     "tests/contract/test_running_code.py",
     "tests/contract/test_subject_binding.py",
     "tests/contract/test_vector_failure.py",
+    "tests/contract/test_vector_cleanup.py",
     "tests/contract/test_audit_lifecycle.py",
     "tests/contract/test_audit_maintenance.py",
     "tests/contract/test_autonomous_admission.py",

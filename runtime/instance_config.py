@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ..contracts import ContractError, InstanceBinding, Origin, TrustedContext
+from ..core.admission import AdmissionPolicy
 from ..core.recall_policy import EMBEDDING_SPACE, RecallPolicy, embedding_space_id
 from .auxiliary import AuxiliaryRuntimeConfig
 from .validation import (
@@ -223,6 +224,18 @@ class RuntimeInstanceConfig:
             embedding_space_id=self.embedding_space_id(),
             owner_names=self.owner_names,
         )
+
+    def admission_policy(self, *, consolidation_port: object | None = None) -> AdmissionPolicy:
+        """Admission this instance captures and drains with.
+
+        Consolidation is scheduled only when a usable port actually exists: an explicitly injected port, or the
+        adapter ``build_auxiliary_runtime`` produced from an approved, configured and ledger-backed route.
+        ``external_consolidation`` alone, without that port, schedules an embedding alone.
+
+        The switch affects future scheduling only.  Queued consolidation work is left untouched, and sources
+        admitted while it is off are not backfilled when it is turned back on.
+        """
+        return AdmissionPolicy(consolidation_enabled=consolidation_port is not None)
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "RuntimeInstanceConfig":

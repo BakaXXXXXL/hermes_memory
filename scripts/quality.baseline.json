@@ -536,7 +536,7 @@
    "C901": {
     "Deletions.purge_sqlite": 16
    },
-   "E501": 14,
+   "E501": 13,
    "PLR0912": {
     "Deletions.purge_sqlite": 16
    }
@@ -1008,7 +1008,6 @@
    "UP035": 1
   },
   "runtime/vector_retention.py": {
-   "E501": 1,
    "UP017": 1,
    "UP035": 1
   },

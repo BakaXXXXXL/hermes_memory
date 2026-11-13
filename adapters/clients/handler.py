@@ -11,10 +11,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol, cast
 
-from scope_recall.contracts import ContractError, Origin, TrustedContext
+from scope_recall.contracts import ContractError, InstanceBinding, Origin, TrustedContext
 from scope_recall.core import CoreConfig, MemoryCore
+from scope_recall.core.admission import BASIC_CORE_ADMISSION, AdmissionPolicy
 from scope_recall.core.capture_inbox import DELETED_KEY
 from scope_recall.runtime.instance_config import RuntimeInstanceConfig
+from scope_recall.runtime.worker_entry import load_config
+from scope_recall.runtime.worker_launch import RUNTIME_CONFIG_FILENAME
 
 from ..runtime_wiring import strict_hook_budget
 from . import transcript
@@ -93,6 +96,39 @@ class HookCall:
         return self.persisted or self.queued
 
 
+def _capture_admission(config_path: str | Path | None, binding: InstanceBinding) -> AdmissionPolicy:
+    """Admission for a capture made before the trusted runtime attaches.
+
+    ``ensure_runtime`` builds the consolidation port from this config after the
+    source is committed.  Reading the route here lets that capture queue the
+    consolidation the port will drain; a config with no approved, configured
+    and ledger-backed route keeps the embedding alone, so nothing waits for a
+    port that will never exist.
+    """
+    path = (
+        Path(config_path).expanduser() if config_path is not None else binding.data_directory / RUNTIME_CONFIG_FILENAME
+    )
+    try:
+        runtime_config = load_config(path)
+    except (OSError, RecursionError, TypeError, ValueError):
+        return BASIC_CORE_ADMISSION
+    if runtime_config.binding != binding:
+        return BASIC_CORE_ADMISSION
+    auxiliary = runtime_config.auxiliary
+    # The approved, configured and ledger-backed route that ``build_auxiliary_runtime`` turns into a
+    # consolidation port.  The scheduler's capability table is not imported here: it loads the worker
+    # entry and would spend most of a hook's budget before the capture starts.
+    if (
+        auxiliary is None
+        or auxiliary.external_consolidation is not True
+        or auxiliary.consolidation is None
+        or auxiliary.ledger_path is None
+    ):
+        return BASIC_CORE_ADMISSION
+    # The port itself is built at attach; a non-None marker says it will exist.
+    return runtime_config.admission_policy(consolidation_port=object())
+
+
 class CodexHookHandler:
     """Stateless per-process handler; durable idempotence lives in core SQLite."""
 
@@ -113,7 +149,7 @@ class CodexHookHandler:
                 raise CodexConfigError("injected core mismatch")
             self.core = host_runtime.core
         elif core is None:
-            self.core = MemoryCore(CoreConfig(config.to_binding()), clock=clock)
+            self.core = MemoryCore(CoreConfig(config.to_binding(), admission_policy=BASIC_CORE_ADMISSION), clock=clock)
         else:
             if core.config.binding != config.to_binding():
                 raise CodexConfigError("injected core binding mismatch")
@@ -157,7 +193,9 @@ class CodexHookHandler:
         if host_runtime is None and core is None:
             # Capture uses a basic Core first.  Trusted runtime attach
             # (Lance/aux/worker) waits until after a durable Source commit.
-            core = MemoryCore(CoreConfig(config.to_binding()), clock=clock)
+            binding = config.to_binding()
+            admission = _capture_admission(trusted_runtime_config_path, binding)
+            core = MemoryCore(CoreConfig(binding, admission_policy=admission), clock=clock)
             handler = cls(config, core=core, clock=clock, hook_started_at=hook_started_at)
             handler._pending_runtime_config_path = trusted_runtime_config_path
             return handler
@@ -189,13 +227,16 @@ class CodexHookHandler:
         ``clock``'s time for when it stored them.
         """
         config = load_shared_client(home, host)
-        core = MemoryCore(CoreConfig(config.to_binding()), clock=clock)
+        runtime_config_path = trusted_runtime_config_path or str(config.runtime_config_path)
+        binding = config.to_binding()
+        admission = _capture_admission(runtime_config_path, binding)
+        core = MemoryCore(CoreConfig(binding, admission_policy=admission), clock=clock)
         handler = cls(
             config, core=core, clock=event_clock if event_clock is not None else clock, hook_started_at=hook_started_at
         )
-        handler._pending_runtime_config_path = trusted_runtime_config_path or str(config.runtime_config_path)
+        handler._pending_runtime_config_path = runtime_config_path
         if host in _CONFIGURED_PROMPT_BUDGET:
-            handler._prompt_budget = _configured_budget(handler._pending_runtime_config_path)
+            handler._prompt_budget = _configured_budget(runtime_config_path)
         return handler
 
     # -- diagnostics and budget ------------------------------------------

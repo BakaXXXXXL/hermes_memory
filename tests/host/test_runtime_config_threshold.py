@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import replace
 
 import pytest
 from scope_recall.adapters.runtime_wiring import attach_trusted_host_runtime
 from scope_recall.contracts import ContractError, InstanceBinding
 from scope_recall.core.recall_policy import EMBEDDING_SPACE, SPACE_ID
+from scope_recall.runtime.auxiliary import AuxiliaryRuntimeConfig
 from scope_recall.runtime.instance import build_runtime_instance, default_vector_factory
 from scope_recall.runtime.instance_config import RuntimeInstanceConfig
 from scope_recall.runtime.lance_port import LanceIndexWriter, LanceVectorRecord
@@ -191,3 +193,137 @@ def test_runtime_mapping_wires_the_owner_s_names(tmp_path):
         instance.close()
     with pytest.raises(ContractError):
         build_runtime_instance(RuntimeInstanceConfig.from_mapping(dict(raw, owner_names="Joy")))
+
+
+def test_runtime_admission_consolidation_follows_the_actual_port(tmp_path):
+    binding = InstanceBinding(
+        "TEST-consolidation-agent",
+        "TEST-consolidation-installation",
+        tmp_path / "data",
+        frozenset({"TEST-scope"}),
+        True,
+    )
+    base = RuntimeInstanceConfig(binding, "TEST-session", binding.scope_ids)
+    assert base.admission_policy().consolidation_enabled is False
+    assert base.admission_policy(consolidation_port=object()).consolidation_enabled is True
+    disabled = replace(
+        base,
+        auxiliary=AuxiliaryRuntimeConfig.from_mapping({"external_embedding": False, "external_consolidation": False}),
+    )
+    assert disabled.admission_policy().consolidation_enabled is False
+    approved_without_route = replace(
+        base,
+        auxiliary=AuxiliaryRuntimeConfig.from_mapping({"external_embedding": False, "external_consolidation": True}),
+    )
+    assert approved_without_route.admission_policy().consolidation_enabled is False
+    route_without_ledger = replace(
+        base,
+        auxiliary=AuxiliaryRuntimeConfig.from_mapping(
+            {
+                "external_embedding": False,
+                "external_consolidation": True,
+                "consolidation": {
+                    "kind": "openai",
+                    "model": "TEST-model",
+                    "endpoint": "https://example.invalid/v1/chat/completions",
+                    "credential_env": "TEST_CONSOLIDATION_KEY",
+                    "output_limit_field": "max_tokens",
+                    "max_output_tokens": 256,
+                },
+            }
+        ),
+    )
+    assert route_without_ledger.admission_policy().consolidation_enabled is False
+
+
+def _captured_work_types(instance):
+    receipt = instance.core.record_event(
+        instance.config.context(),
+        source_event(source_event_key="TEST-consolidation/source", content="TEST substantive source"),
+        scope_id="TEST-scope",
+        remaining_seconds=10,
+    )
+    with sqlite3.connect(instance.core.storage.path) as conn:
+        return conn.execute(
+            "SELECT work_type FROM work_items WHERE subject_ref=? ORDER BY work_type",
+            (receipt.event_refs[0].ref,),
+        ).fetchall()
+
+
+def test_runtime_capture_queues_embedding_alone_without_a_consolidation_port(tmp_path):
+    binding = InstanceBinding(
+        "TEST-no-port-agent",
+        "TEST-no-port-installation",
+        tmp_path / "data",
+        frozenset({"TEST-scope"}),
+        True,
+    )
+    config = RuntimeInstanceConfig(
+        binding,
+        "TEST-session",
+        binding.scope_ids,
+        auxiliary=AuxiliaryRuntimeConfig.from_mapping({"external_embedding": False, "external_consolidation": False}),
+    )
+    instance = build_runtime_instance(config)
+    try:
+        instance.core.initialize()
+        assert _captured_work_types(instance) == [("embed",)]
+    finally:
+        instance.close()
+
+
+@pytest.mark.parametrize(
+    "auxiliary",
+    [
+        {"external_embedding": False, "external_consolidation": True},
+        {
+            "external_embedding": False,
+            "external_consolidation": True,
+            "consolidation": {
+                "kind": "openai",
+                "model": "TEST-model",
+                "endpoint": "https://example.invalid/v1/chat/completions",
+                "credential_env": "TEST_CONSOLIDATION_KEY",
+                "output_limit_field": "max_tokens",
+                "max_output_tokens": 256,
+            },
+        },
+    ],
+)
+def test_runtime_capture_without_a_usable_consolidation_port_queues_embedding_alone(tmp_path, auxiliary):
+    binding = InstanceBinding(
+        "TEST-approved-agent",
+        "TEST-approved-installation",
+        tmp_path / "data",
+        frozenset({"TEST-scope"}),
+        True,
+    )
+    config = RuntimeInstanceConfig(
+        binding,
+        "TEST-session",
+        binding.scope_ids,
+        auxiliary=AuxiliaryRuntimeConfig.from_mapping(auxiliary),
+    )
+    instance = build_runtime_instance(config)
+    try:
+        instance.core.initialize()
+        assert _captured_work_types(instance) == [("embed",)]
+    finally:
+        instance.close()
+
+
+def test_runtime_capture_queues_consolidation_when_a_port_is_injected(tmp_path):
+    binding = InstanceBinding(
+        "TEST-port-agent",
+        "TEST-port-installation",
+        tmp_path / "data",
+        frozenset({"TEST-scope"}),
+        True,
+    )
+    config = RuntimeInstanceConfig(binding, "TEST-session", binding.scope_ids)
+    instance = build_runtime_instance(config, consolidation=object())
+    try:
+        instance.core.initialize()
+        assert _captured_work_types(instance) == [("consolidate",), ("embed",)]
+    finally:
+        instance.close()

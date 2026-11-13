@@ -594,3 +594,114 @@ def test_refill_counts_the_queue_once_however_many_scopes_the_worker_binds(tmp_p
     monkeypatch.setattr(admission, "pending_count", lambda *args, **kwargs: counted.append(args[1]) or 0)
     assert app.records.resume_deferred(worker, remaining_seconds=10) == ()
     assert counted == []
+
+
+@pytest.mark.parametrize(
+    "role,origin",
+    [("user", "human_direct"), ("assistant", "human_direct"), ("tool", "tool_observation")],
+)
+def test_consolidation_disabled_queues_only_an_embedding_for_every_role(tmp_path, role, origin):
+    """A route that cannot consolidate still embeds every source: the person's message, the assistant's reply and a
+    tool output all keep recall by meaning, and none of them queues work no port can run."""
+    app, ctx = app_at(tmp_path, AdmissionPolicy(consolidation_enabled=False))
+    receipt = capture(
+        app,
+        replace(ctx, actor_origin=origin),
+        f"TEST-no-consolidation/{role}",
+        f"TEST substantive {role} source",
+        role=role,
+        origin=origin,
+    )
+    assert receipt.semantic_state == "pending" and receipt.gaps == ()
+    assert work_for(app, receipt.event_refs[0].ref) == {"embed": "pending"}
+
+
+@pytest.mark.parametrize(
+    "role,origin",
+    [("user", "human_direct"), ("assistant", "human_direct"), ("tool", "tool_observation")],
+)
+def test_consolidation_enabled_keeps_the_existing_work_for_every_role(tmp_path, role, origin):
+    app, ctx = app_at(tmp_path, AdmissionPolicy())
+    receipt = capture(
+        app,
+        replace(ctx, actor_origin=origin),
+        f"TEST-consolidation/{role}",
+        f"TEST substantive {role} source",
+        role=role,
+        origin=origin,
+    )
+    expected = {"embed": "pending"} if role == "tool" else {"consolidate": "pending", "embed": "pending"}
+    assert receipt.semantic_state == "pending" and receipt.gaps == ()
+    assert work_for(app, receipt.event_refs[0].ref) == expected
+
+
+def test_on_demand_scheduling_with_consolidation_disabled_queues_only_an_embedding(tmp_path):
+    app, ctx = app_at(tmp_path, AdmissionPolicy(consolidation_enabled=False))
+    saved = capture(app, ctx, "TEST-ack-no-consolidation", "好的")
+    receipt = app.records.schedule_source(ctx, saved.event_refs[0].ref, 1, remaining_seconds=10)
+    assert (receipt.disposition, receipt.queued_work) == ("scheduled", 1)
+    assert work_for(app, saved.event_refs[0].ref) == {"embed": "pending"}
+
+
+def test_refill_with_consolidation_disabled_queues_only_an_embedding(tmp_path):
+    app, ctx = app_at(tmp_path, AdmissionPolicy(consolidation_enabled=False, max_pending_work=2, important_reserve=0))
+    first = capture(app, ctx, "TEST-first-no-consolidation", "TEST substantive source one")
+    deferred = capture(app, ctx, "TEST-deferred-no-consolidation", "TEST substantive source two")
+    assert work_for(app, first.event_refs[0].ref) == {"embed": "pending"}
+    assert deferred.admission == ("admission_deferred:queue_capacity",)
+    with app.storage.write(ctx, remaining_seconds=10) as tx:
+        work = tx.work.claim_next("TEST-worker", app.clock.utc_now(), lease_seconds=10)
+        for item in work:
+            tx.work.complete(item.work_id, item.lease_token, item.lease_owner, now=app.clock.utc_now())
+    resumed = app.records.resume_deferred(ctx, remaining_seconds=10)
+    assert [(item.ref, item.disposition, item.queued_work) for item in resumed] == [
+        (deferred.event_refs[0].ref, "scheduled", 1)
+    ]
+    assert work_for(app, deferred.event_refs[0].ref) == {"embed": "pending"}
+
+
+def test_deferred_page_with_consolidation_disabled_does_not_select_for_consolidation(tmp_path):
+    """The refill page chose rows for every work type.  With consolidation disabled and the embedding queue full,
+    the free consolidation slot must not make the page select a source it cannot schedule at all."""
+    app, ctx = app_at(tmp_path, AdmissionPolicy(consolidation_enabled=False, max_pending_work=2, important_reserve=0))
+    capture(app, ctx, "TEST-fill-embedding", "TEST substantive source one")
+    deferred = capture(app, ctx, "TEST-waiting-embedding", "TEST substantive source two")
+    assert deferred.admission == ("admission_deferred:queue_capacity",)
+    assert app.records.resume_deferred(ctx, remaining_seconds=10) == ()
+    assert work_for(app, deferred.event_refs[0].ref) == {}
+
+
+def test_consolidation_enabled_must_be_boolean():
+    with pytest.raises(ValueError, match="consolidation enabled"):
+        AdmissionPolicy(consolidation_enabled=1)
+
+
+def test_consolidation_field_keeps_positional_policy_arguments_compatible():
+    policy = AdmissionPolicy(False, 2, 0)
+    assert (
+        policy.enabled,
+        policy.max_pending_work,
+        policy.important_reserve,
+        policy.consolidation_enabled,
+    ) == (False, 2, 0, True)
+
+
+def test_disabling_consolidation_leaves_queued_consolidation_work_untouched(tmp_path):
+    app, ctx = app_at(tmp_path, AdmissionPolicy())
+    old = capture(app, ctx, "TEST-old-consolidation", "TEST substantive source one")
+    assert work_for(app, old.event_refs[0].ref) == {"consolidate": "pending", "embed": "pending"}
+    disabled = MemoryCore(CoreConfig(ctx.binding, admission_policy=AdmissionPolicy(consolidation_enabled=False)))
+    new = capture(disabled, ctx, "TEST-new-embedding", "TEST substantive source two")
+    assert work_for(app, old.event_refs[0].ref) == {"consolidate": "pending", "embed": "pending"}
+    assert work_for(disabled, new.event_refs[0].ref) == {"embed": "pending"}
+
+
+def test_reenabling_consolidation_does_not_backfill_sources_admitted_while_disabled(tmp_path):
+    app, ctx = app_at(tmp_path, AdmissionPolicy(consolidation_enabled=False))
+    old = capture(app, ctx, "TEST-admitted-disabled", "TEST substantive source one")
+    assert work_for(app, old.event_refs[0].ref) == {"embed": "pending"}
+    enabled = MemoryCore(CoreConfig(ctx.binding, admission_policy=AdmissionPolicy()))
+    assert enabled.records.resume_deferred(ctx, remaining_seconds=10) == ()
+    assert work_for(enabled, old.event_refs[0].ref) == {"embed": "pending"}
+    new = capture(enabled, ctx, "TEST-admitted-enabled", "TEST substantive source two")
+    assert work_for(enabled, new.event_refs[0].ref) == {"consolidate": "pending", "embed": "pending"}

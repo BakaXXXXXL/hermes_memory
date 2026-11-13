@@ -62,6 +62,36 @@ class Sources:
             return source
         return None
 
+    def source_identity(self, source_event_key: str) -> tuple[str, int]:
+        """The stable object ref and highest stored generation for a host key.
+
+        The ref is derived from the key, so a caller can find the object after
+        every generation was suppressed; the ceiling includes suppressed rows so
+        a writer never reuses a revision.  The project and branch partition is
+        the same exact one ``Deletions.target`` accepts: a global row (NULL) is
+        not visible from a named project.
+        """
+        if (
+            type(source_event_key) is not str
+            or not 1 <= len(source_event_key) <= 512
+            or not source_event_key.strip()
+            or "\x00" in source_event_key
+        ):
+            raise ContractError("INPUT_INVALID", "source_event_key")
+        conn = self._tx._check()
+        ref = self._source_ref(source_event_key)
+        scopes = sorted(self._tx.context.allowed_scope_ids)
+        if not scopes:
+            return ref, 0
+        marks = ",".join("?" for _ in scopes)
+        row = conn.execute(
+            f"""SELECT max(source_revision) AS revision FROM source_events
+            WHERE event_id=? AND scope_id IN ({marks})
+            AND project_id IS ? AND branch_id IS ?""",
+            (ref, *scopes, self._tx.context.project_id, self._tx.context.branch_id),
+        ).fetchone()
+        return ref, int(row["revision"] or 0)
+
     def witnessed_at(self, source: StoredSource) -> str | None:
         """When a source was said or observed, as far as the store can tell.
 
