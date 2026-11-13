@@ -62,7 +62,7 @@ OVERLAP = 180
 
 #: The store API this script is written against.  A different major version, or
 #: an older minor release, is refused before any state is loaded or saved.
-CORE_API_VERSION = (3, 10, 3)
+CORE_API_VERSION = (3, 10, 7)
 
 FM_RE = re.compile(r"^---\n(.*?)\n---\n", re.S)
 HEADING_RE = re.compile(r"^##\s+(.+?)\s*$", re.M)

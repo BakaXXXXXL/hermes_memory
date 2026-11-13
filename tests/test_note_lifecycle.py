@@ -584,7 +584,7 @@ def test_missing_source_identity_fails_before_state_is_touched(tmp_path, monkeyp
 
 
 def test_core_version_mismatch_fails_before_state_is_touched(tmp_path, monkeypatch):
-    monkeypatch.setattr(note_indexer, "core_version", lambda: (3, 10, 2))
+    monkeypatch.setattr(note_indexer, "core_version", lambda: (3, 10, 6))
     notes = tmp_path / "notes"
     notes.mkdir()
     state = tmp_path / "state.json"
@@ -598,7 +598,7 @@ def test_core_version_mismatch_fails_before_state_is_touched(tmp_path, monkeypat
 
 def test_core_version_at_the_required_minimum_is_accepted(app, monkeypatch):
     core, ctx, scope, notes, state = app
-    monkeypatch.setattr(note_indexer, "core_version", lambda: (3, 10, 3))
+    monkeypatch.setattr(note_indexer, "core_version", lambda: (3, 10, 7))
 
     stats = note_indexer.index_notes(core, ctx, notes, state, scope_id=scope, apply=False)
 
