@@ -1,0 +1,28 @@
+# Nested Scope Recall checkout (separate repository).
+/src/
+
+# Production script and state.
+/note_indexer.production.py
+/note-index.json
+*.sqlite3
+*.sqlite3-*
+*.db
+
+# Python and test artifacts.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Cache and local runtime output.
+/cache/
+.cache/
+*.log
+
+# Local environment files.
+.env
+.env.*
