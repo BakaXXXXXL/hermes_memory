@@ -1,0 +1,14 @@
+[Unit]
+Description=Hermes memory health watchdog
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/root/.hermes/scripts/health_watchdog.py
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+Environment=HERMES_HOME=/root/.hermes
+ExecStart=/usr/bin/python3 /root/.hermes/scripts/health_watchdog.py --trigger timer
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=180

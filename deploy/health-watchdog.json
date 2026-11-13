@@ -1,0 +1,63 @@
+{
+  "paths": {
+    "note_state": "/root/.hermes/state/note-index.json",
+    "notes_dir": "/root/.hermes/knowledge/notes",
+    "heartbeat": "/root/.hermes/state/gateway.heartbeat",
+    "backup_daily": "/root/hermes-shared-store/backups/auto/daily",
+    "backup_weekly": "/root/hermes-shared-store/backups/auto/weekly",
+    "weekly_reports": "/root/.hermes/reports/memory-health",
+    "errors_log": "/root/.hermes/logs/errors.log",
+    "memory_db": "/root/hermes-shared-store/memory.sqlite3",
+    "cron_jobs": "/root/.hermes/cron/jobs.json",
+    "state": "/root/.hermes/scripts/.health_watchdog.state.json",
+    "log": "/root/.hermes/logs/health-watchdog.log",
+    "lock": "/root/.hermes/scripts/.health_watchdog.lock",
+    "pending": "/root/.hermes/scripts/.health_watchdog.pending.jsonl"
+  },
+  "units": {
+    "note_indexer": "note-indexer.service",
+    "note_indexer_timer": "note-indexer.timer",
+    "wake": "scope-recall-wake.service",
+    "wake_timer": "scope-recall-wake.timer",
+    "gateway": "hermes-gateway.service"
+  },
+  "thresholds": {
+    "note_state_max_age": 900,
+    "note_timer_max_age": 1200,
+    "wake_max_age": 900,
+    "heartbeat_max_age": 180,
+    "backup_max_age": 108000,
+    "backup_weekly_max_age": 691200,
+    "backup_min_bytes": 1000000,
+    "backup_cron_max_age": 129600,
+    "backup_cron_grace": 7200,
+    "weekly_report_max_age": 691200,
+    "weekly_next_run_grace": 7200,
+    "entry_max_age": 86400,
+    "rejection_lookback": 604800,
+    "rejection_state_keep": 2592000,
+    "dedup_seconds": 1800,
+    "command_timeout": 15,
+    "lock_timeout": 30,
+    "failure_lock_timeout": 120,
+    "pending_failure_max_age": 86400,
+    "max_alert_issues": 20,
+    "entry_scan_rows": 5000,
+    "rejection_scan_max_bytes": 8000000,
+    "rejection_scan_max_lines": 50000
+  },
+  "notify": {
+    "channels": [
+      "hermes",
+      "smtp"
+    ],
+    "hermes_bin": "/usr/local/lib/hermes-agent/.hermes/bin/hermes",
+    "hermes_target": "telegram",
+    "smtp_env": "/root/.hermes/qq_smtp.env",
+    "smtp_timeout": 20
+  },
+  "weekly_job_id": "549fe0406878",
+  "backup_job_id": "4d313aab436e",
+  "rejection_marker": "not stored (plaintext_secret_rejected)",
+  "rejection_bootstrap": true
+}

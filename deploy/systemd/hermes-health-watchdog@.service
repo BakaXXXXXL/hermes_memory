@@ -1,0 +1,11 @@
+[Unit]
+Description=Hermes health alert for failed unit %i
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+Environment=HERMES_HOME=/root/.hermes
+ExecStart=/usr/bin/python3 /root/.hermes/scripts/health_watchdog.py --trigger failure --unit %i
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=180

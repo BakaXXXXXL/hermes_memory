@@ -1,0 +1,26 @@
+# Nested Scope Recall checkout (separate repository).
+/src/
+
+# Read-only copies of production scripts.
+/reference/
+
+# Python and test artifacts.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Cache and local runtime output.
+/cache/
+.cache/
+*.log
+*.state.json
+*.pending.jsonl
+
+# Local environment files.
+.env
+.env.*
