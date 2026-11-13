@@ -89,6 +89,7 @@ def remote(tmp_path, monkeypatch):
         entry_id="owner",
         display_name="TEST Owner",
         now=NOW,
+        store_owner=True,
     )
     owner = next(a for a in read_shared_payload(root)["entries"][0]["audiences"] if a["kind"] == "owner_private")
     home = tmp_path / "TEST-server-entry"

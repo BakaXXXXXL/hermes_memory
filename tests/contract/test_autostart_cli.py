@@ -297,3 +297,53 @@ def test_no_gui_interpreter_fails_closed_instead_of_registering_a_flashing_task(
     monkeypatch.setattr(windows_wake.subprocess, "run", probe)
     with pytest.raises(ValueError, match="^autostart_gui_interpreter_unavailable$"):
         windows_wake.wake_command(python, tmp_path / "config.json")
+
+
+def test_the_timer_launches_for_retention_due_not_every_five_minutes(tmp_path, monkeypatch):
+    """A retention window is outside the work queue: its recorded hour must start a worker, and the timer ticks
+    before that hour must launch nothing."""
+    from dataclasses import replace
+    from datetime import timedelta
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from scope_recall.runtime import resume_entry, vector_retention
+    from scope_recall.runtime.instance_config import VectorRuntimeConfig
+    from test_finite_supervisor import NOW, fixture
+
+    _core, config, written = fixture(tmp_path)
+    path = config.binding.data_directory / "runtime-config.json"
+    path.write_bytes(written.read_bytes())
+    monkeypatch.setattr(autostart, "_windows", lambda: False)
+    autostart.apply(autostart.plan(path, Path(sys.executable), user_id=None))
+    vector = VectorRuntimeConfig(
+        backend="sqlite-bruteforce",
+        storage_dir=tmp_path / "vectors",
+        table_name="TEST-vectors",
+        dimensions=1,
+        test_injection_override=True,
+        tool_output_retention_days=60,
+    )
+    config = replace(config, vector=vector)
+    monkeypatch.setattr(resume_entry, "load_config", lambda _path: config)
+    launched = []
+
+    def launcher(*args, **kwargs):
+        launched.append(args)
+        return SimpleNamespace(pid=7)
+
+    assert resume_entry.resume_once(path, launcher=launcher, now=NOW)["launched"] is True
+    due = NOW.isoformat().replace("+00:00", "Z")
+    key = vector_retention.retention_key(
+        installation_id=config.binding.installation_id,
+        project_id=config.project_id,
+        branch_id=config.branch_id,
+        scope_ids=config.allowed_scope_ids,
+        days=60,
+    )
+    vector_retention.write_state(vector.storage_dir, key, {"retention_days": 60, "finished_at": due})
+    result = resume_entry.resume_once(path, launcher=launcher, now=NOW + timedelta(minutes=5))
+    assert (result["launched"], result["status"]) == (False, "vector_retention")
+    assert result["next_wake_at"] == (NOW + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    assert resume_entry.resume_once(path, launcher=launcher, now=NOW + timedelta(hours=1))["launched"] is True
+    assert len(launched) == 2

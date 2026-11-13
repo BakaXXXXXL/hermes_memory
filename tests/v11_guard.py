@@ -1,6 +1,7 @@
 import os
 import re
 import shlex
+import socket
 import sys
 from pathlib import Path
 
@@ -39,6 +40,12 @@ _CHECKOUT_GIT_SUBCOMMANDS = frozenset(
     }
 )
 _ALLOW_LOOPBACK = os.environ.get("SCOPE_RECALL_TEST_ALLOW_LOOPBACK") == "1"
+
+#: The import probe ``vector.lance_native.native_import_is_safe`` runs before the
+#: in-process store is trusted.  It is a child process by construction, so a tier
+#: that has not enabled child processes (the storage tier) admits this one exact
+#: command; every other child still follows the tier's allowlist.
+_NATIVE_IMPORT_PROBE = "import lancedb, pyarrow"
 
 
 def _allowed_roots() -> tuple[Path, ...]:
@@ -169,6 +176,11 @@ def _is_local_git_command(tokens: list[str], cwd=None) -> bool:
 
 
 def _check_owned_child_process(args) -> None:
+    if _is_native_import_probe(args):
+        cwd = args[2] if len(args) > 2 else None
+        if cwd and not _is_allowed_path(cwd):
+            raise PermissionError("TEST_BOUNDARY: child cwd outside TEST boundary")
+        return
     if not _ALLOW_CHILD_PROCESSES or _PROCESS_TIER not in _OWNED_SUBPROCESS_TIERS:
         raise PermissionError("TEST_BOUNDARY: child processes disabled")
     command = args[1] if len(args) > 1 else None
@@ -290,17 +302,41 @@ def _anchored_dir(value, dir_fd=None):
         return value
 
 
+def _is_native_import_probe(args) -> bool:
+    """Whether this is the one child process LanceDB's import probe runs."""
+    command = args[1] if len(args) > 1 else None
+    tokens = _command_tokens(command)
+    if len(tokens) != 3 or tokens[1] != "-c" or tokens[2] != _NATIVE_IMPORT_PROBE:
+        return False
+    try:
+        return Path(tokens[0]).resolve(strict=False) == _PYTHON
+    except (TypeError, ValueError, OSError):
+        return False
+
+
+def _socket_allowed(event, args) -> bool:
+    """Whether this socket call is local IPC or a permitted loopback connection."""
+    # An AF_UNIX socket is local IPC, not network access: asyncio's event loop
+    # makes a socketpair for its self-pipe even in a test process that may not
+    # open network sockets.
+    if event == "socket.__new__" and len(args) > 1 and args[1] == getattr(socket, "AF_UNIX", 1):
+        return True
+    if _ALLOW_LOOPBACK and event == "socket.__new__":
+        return True
+    if _ALLOW_LOOPBACK and event in {"socket.connect", "socket.bind"} and len(args) > 1:
+        address = args[1]
+        host = address[0] if isinstance(address, tuple) and address else ""
+        if host in {"127.0.0.1", "::1", "localhost"}:
+            return True
+    # An HTTP client resolves even a numeric loopback host before it connects.
+    if _ALLOW_LOOPBACK and event == "socket.getaddrinfo" and args and args[0] in {"127.0.0.1", "::1", "localhost"}:
+        return True
+    return False
+
+
 def _audit(event, args):
     if event.startswith("socket."):
-        if _ALLOW_LOOPBACK and event == "socket.__new__":
-            return
-        if _ALLOW_LOOPBACK and event in {"socket.connect", "socket.bind"} and len(args) > 1:
-            address = args[1]
-            host = address[0] if isinstance(address, tuple) and address else ""
-            if host in {"127.0.0.1", "::1", "localhost"}:
-                return
-        # An HTTP client resolves even a numeric loopback host before it connects.
-        if _ALLOW_LOOPBACK and event == "socket.getaddrinfo" and args and args[0] in {"127.0.0.1", "::1", "localhost"}:
+        if _socket_allowed(event, args):
             return
         raise PermissionError("TEST_BOUNDARY: network access denied")
     if event == "subprocess.Popen":

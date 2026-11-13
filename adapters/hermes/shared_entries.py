@@ -19,7 +19,9 @@ from scope_recall.core.storage import SQLiteStorage
 from .audiences import (
     LOCAL_USER_ID,
     HermesIdentityError,
+    assert_scope_kinds,
     audience_entry,
+    owner_private_scope_ids,
 )
 from .installation import (
     MANIFEST_FILENAME,
@@ -29,6 +31,8 @@ from .installation import (
     bounded_text,
     load_installation_manifest,
     scope_id_list,
+    shared_entry_audience_scopes,
+    shared_entry_private_scope,
     validate_archive_fields,
 )
 
@@ -201,13 +205,51 @@ def shared_entry_manifest(root: Path | str, entry_id: str, *, hermes_home: Path 
     return _entry_view(store, payload, record)
 
 
+def _entry_owner_private_scopes(entry: Mapping[str, Any]) -> frozenset[str]:
+    scopes = entry.get("audience_scopes")
+    audiences = entry.get("audiences")
+    return owner_private_scope_ids(
+        scopes if isinstance(scopes, Mapping) else {},
+        audiences if isinstance(audiences, list) else (),
+    )
+
+
+def store_owner_private_scopes(payload: Mapping[str, Any], *, exclude_entry: str | None = None) -> frozenset[str]:
+    """Every entry's owner-private scopes, including a detached entry's: its memories stay.
+
+    ``exclude_entry`` leaves out only that entry's own entry-private scope, the
+    one a non-owner entry keeps when it re-attaches.  A scope carried over from
+    an installation's owner stays protected: replacing the entry that declared
+    it must not let another entry's older rows grant it.
+    """
+    own = shared_entry_private_scope(exclude_entry) if exclude_entry is not None else None
+    protected: set[str] = set()
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        return frozenset()
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        found = _entry_owner_private_scopes(entry)
+        if own is not None and entry.get("entry_id") == exclude_entry:
+            found = found - {own}
+        protected |= found
+    return frozenset(protected)
+
+
+def _record_is_store_owner(entry: Mapping[str, Any]) -> bool:
+    """Whether an existing record is an owner; a record written before the marker was written is one."""
+    return entry.get("store_owner", True) is True or entry.get("host") in CLIENT_HOSTS
+
+
 def _entry_view(store: Path, payload: dict[str, Any], record: Mapping[str, Any]) -> InstallationManifest:
     if record.get("host") not in ENTRY_HOSTS:
         raise HermesIdentityError("shared store entry names an unknown host")
     home = Path(bounded_text(record.get("home"), field="home"))
     if not home.is_absolute():
         raise HermesIdentityError("shared store entry home must be absolute")
-    fields = {name: check(record.get(name)) for name, check in REQUIRED_FIELDS}
+    fields = {name: check(record.get(name)) for name, check in REQUIRED_FIELDS if name != "audience_scopes"}
+    fields["audience_scopes"] = shared_entry_audience_scopes(record.get("audience_scopes"))
     manifest = InstallationManifest(
         schema_version=SCHEMA_VERSION,
         installation_id=payload["installation_id"],
@@ -219,6 +261,7 @@ def _entry_view(store: Path, payload: dict[str, Any], record: Mapping[str, Any])
         entry_id=_entry_id(record.get("entry_id")),
         entry_name=_display_name(record.get("display_name")),
         entry_host=record["host"],
+        protected_scope_ids=store_owner_private_scopes(payload),
         **fields,
     )
     validate_archive_fields(manifest, present=False, test_mode=payload["test_mode"])
@@ -288,6 +331,144 @@ def write_shared_payload(root: Path | str, payload: dict[str, Any]) -> Path:
     return store / MANIFEST_FILENAME
 
 
+def _revalidate_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    return audience_entry(
+        platform=row["platform"],
+        user_id=row["user_id"],
+        chat_type=row["chat_type"],
+        chat_id=row["chat_id"],
+        thread_id=row["thread_id"],
+        gateway_session_key=row["gateway_session_key"],
+        agent_workspace=row["agent_workspace"],
+        allowed_scope_ids=row["allowed_scope_ids"],
+        writable_scope_ids=row.get("writable_scope_ids", ()),
+        capture_scope_id=row["capture_scope_id"],
+        kind=str(row.get("kind") or "conversation"),
+    )
+
+
+def _narrow_audiences(
+    rows: Sequence[Mapping[str, Any]], protected: frozenset[str], *, protect_owner_rows: bool = True
+) -> tuple[list[dict[str, Any]], dict[str, str], list[str]]:
+    """Drop owner-private scopes from every non-owner row; a row left with nothing is removed.
+
+    An installation migrated from 2.x can have one broad row per chat carrying
+    the owner's private scopes beside its own.  Carrying that row unchanged into
+    a shared store would grant every friend who matches the chat the owner's
+    memory, so only an owner_private row keeps them.  A row whose capture was
+    one of them becomes read-only rather than writing into the owner's scope.
+    ``protect_owner_rows=False`` treats an owner_private row like any other,
+    which is how a non-owner entry loses a carried-over private scope while its
+    own new private scope, which is not protected, stays.
+    """
+    narrowed: list[dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        if not protect_owner_rows or str(row.get("kind") or "conversation") != "owner_private":
+            allowed = [scope for scope in row["allowed_scope_ids"] if scope not in protected]
+            if not allowed:
+                continue
+            writable = [scope for scope in row.get("writable_scope_ids", ()) if scope in allowed]
+            capture = row["capture_scope_id"]
+            if capture not in writable:
+                writable, capture = [], ""
+            row = audience_entry(
+                platform=row["platform"],
+                user_id=row["user_id"],
+                chat_type=row["chat_type"],
+                chat_id=row["chat_id"],
+                thread_id=row["thread_id"],
+                gateway_session_key=row["gateway_session_key"],
+                agent_workspace=row["agent_workspace"],
+                allowed_scope_ids=allowed,
+                writable_scope_ids=writable,
+                capture_scope_id=capture,
+                kind=str(row.get("kind") or "conversation"),
+            )
+        else:
+            row = _revalidate_row(row)
+        narrowed.append(row)
+    if not narrowed:
+        raise HermesIdentityError("an entry's grants carry no scope of their own")
+    audience_scopes: dict[str, str] = {}
+    for row in narrowed:
+        kind = str(row.get("kind") or "conversation")
+        capture = row["capture_scope_id"]
+        if capture:
+            audience_scopes.setdefault(kind, capture)
+    mapped = sorted({scope for row in narrowed for scope in row["allowed_scope_ids"]})
+    assert_scope_kinds(audience_scopes, narrowed)
+    return narrowed, audience_scopes, mapped
+
+
+def narrow_shared_record(
+    record: Mapping[str, Any], protected: frozenset[str], *, store_owner: bool = True
+) -> dict[str, Any]:
+    """The record with every protected scope removed from rows that do not own it.
+
+    A store owner's owner_private rows are kept; any other entry's are treated
+    like its other rows, so a carried-over private scope cannot become a grant
+    and its own entry-private scope, which is not protected, stays.
+    """
+    rows, audience_scopes, mapped = _narrow_audiences(record["audiences"], protected, protect_owner_rows=store_owner)
+    return {**record, "audiences": rows, "audience_scopes": audience_scopes, "scope_ids": mapped}
+
+
+def _assert_no_owner_private_conflict(payload: Mapping[str, Any], record: Mapping[str, Any]) -> None:
+    """Refuse an entry whose scopes already belong to another entry's owner_private grant."""
+    existing: set[str] = set()
+    for entry in payload["entries"]:
+        if entry["entry_id"] == record["entry_id"]:
+            continue
+        existing |= _entry_owner_private_scopes(entry)
+    conflict = sorted(set(record["scope_ids"]) & existing)
+    if conflict:
+        raise HermesIdentityError(
+            "owner_private scope conflict: this entry would share another entry's owner_private scope; "
+            "attach the owner's own installation with --grants-from --store-owner, or remove the other entry first"
+        )
+
+
+def _entry_private_row(entry_id: str, source: InstallationManifest) -> dict[str, Any]:
+    """The friend entry's own private scope, on the CLI route its installation used.
+
+    The scope is named after the entry and is not any carried-over owner scope.
+    Keeping the source's CLI route means the home binds the same way it did
+    before it attached; when the source has no CLI owner row, its first owner
+    row's route is used.
+    """
+    scope = shared_entry_private_scope(entry_id)
+    owner_rows = [row for row in source.audiences if row.get("kind") == "owner_private"]
+    owner = next((row for row in owner_rows if row.get("platform") == "cli"), owner_rows[0] if owner_rows else None)
+    if owner is None:
+        return audience_entry(
+            platform="cli",
+            user_id=LOCAL_USER_ID,
+            chat_type="cli",
+            chat_id=LOCAL_USER_ID,
+            thread_id="main",
+            gateway_session_key="",
+            agent_workspace="default",
+            allowed_scope_ids=[scope],
+            writable_scope_ids=[scope],
+            capture_scope_id=scope,
+            kind="owner_private",
+        )
+    return audience_entry(
+        platform=owner["platform"],
+        user_id=owner["user_id"],
+        chat_type=owner["chat_type"],
+        chat_id=owner["chat_id"],
+        thread_id=owner["thread_id"],
+        gateway_session_key=owner["gateway_session_key"],
+        agent_workspace=owner["agent_workspace"],
+        allowed_scope_ids=[scope],
+        writable_scope_ids=[scope],
+        capture_scope_id=scope,
+        kind="owner_private",
+    )
+
+
 def shared_entry_record(
     source: InstallationManifest,
     *,
@@ -295,19 +476,50 @@ def shared_entry_record(
     display_name: str,
     attached_at: str,
     python_executable: str | None = None,
+    store: Mapping[str, Any] | None = None,
+    protected_scope_ids: frozenset[str] = frozenset(),
+    store_owner: bool = False,
 ) -> dict[str, Any]:
     """An entry's grants, carried over from the local installation it was.
 
     The audience rows are the ones the owner approved for that installation,
-    unchanged, so every chat reaches what it reached before and the owner's
-    chats meet in the scopes the installations already share.  Archive and
-    retained scopes stay with the old store: a shared store starts empty, and
-    ``import-entry`` brings the old store's memories in.
+    except that an owner-private scope is kept only on an owner_private row:
+    every chat still reaches the scopes it reached before, and a conversation
+    row cannot hand a friend the owner's private memory.  ``store`` checks the
+    installation against the store it joins; ``protected_scope_ids`` names the
+    scopes every entry of that store already holds private.
+
+    ``store_owner`` is the separate, explicit statement that this entry is the
+    store owner and its owner-private rows are the store owner's.  It defaults
+    to false: an ordinary attach of a home that had its own installation is a
+    friend.  It keeps the installation's group, conversation and project grants
+    but drops every carried-over owner_private row and every protected scope,
+    then gives the entry one private scope of its own.  A client's grants are
+    never taken from such an entry.  Archive and retained scopes stay with the
+    old store: a shared store starts empty, and ``import-entry`` brings the old
+    store's memories in.
     """
     if source.installation_kind != "local":
         raise HermesIdentityError("an entry is carried over from a local installation")
-    rows = [dict(row) for row in source.audiences]
-    mapped = sorted({scope_id for row in rows for scope_id in row["allowed_scope_ids"]})
+    if store is not None and (source.agent_id, source.test_mode) != (store["agent_id"], store["test_mode"]):
+        raise HermesIdentityError("installation agent_id or test_mode differs from the shared store's")
+    owner_principals = [dict(item) for item in source.owner_principals]
+    if store_owner:
+        protected = owner_private_scope_ids(source.audience_scopes, source.audiences) | protected_scope_ids
+        rows, audience_scopes, mapped = _narrow_audiences(source.audiences, protected)
+    else:
+        private_row = _entry_private_row(entry_id, source)
+        private_scope = private_row["capture_scope_id"]
+        # The entry's own new scope is not a carried-over owner scope, even
+        # when a fresh entry's source is the one that declared it.
+        protected = (owner_private_scope_ids(source.audience_scopes, source.audiences) | protected_scope_ids) - {
+            private_scope
+        }
+        carried = tuple(row for row in source.audiences if str(row.get("kind") or "conversation") != "owner_private")
+        rows, audience_scopes, mapped = _narrow_audiences((*carried, private_row), protected, protect_owner_rows=False)
+        principal = dict(platform=private_row["platform"], user_id=private_row["user_id"])
+        if principal not in owner_principals:
+            owner_principals.append(principal)
     record: dict[str, Any] = {
         "entry_id": _entry_id(entry_id),
         "display_name": _display_name(display_name),
@@ -315,9 +527,10 @@ def shared_entry_record(
         "home": str(source.hermes_home),
         "attached_at": bounded_text(attached_at, field="attached_at"),
         "scope_ids": mapped,
-        "owner_principals": [dict(item) for item in source.owner_principals],
-        "audience_scopes": {kind: scope for kind, scope in source.audience_scopes.items() if scope in mapped},
+        "owner_principals": owner_principals,
+        "audience_scopes": audience_scopes,
         "audiences": rows,
+        "store_owner": bool(store_owner),
     }
     if python_executable is not None:
         record["python_executable"] = bounded_text(python_executable, field="python_executable")
@@ -369,6 +582,7 @@ def client_entry_record(
         "owner_principals": [dict(platform=host, user_id=LOCAL_USER_ID)],
         "audience_scopes": {"owner_private": capture_scope_id},
         "audiences": [row],
+        "store_owner": True,
     }
     if python_executable is not None:
         record["python_executable"] = bounded_text(python_executable, field="python_executable")
@@ -383,18 +597,37 @@ def attach_shared_entry(
     display_name: str,
     now: str,
     python_executable: str | None = None,
+    store_owner: bool = False,
 ) -> InstallationManifest:
-    """Make ``source``'s home an entry of the shared store at ``root``, with ``source``'s grants."""
+    """Make ``source``'s home an entry of the shared store at ``root``, with ``source``'s grants.
+
+    ``store_owner`` is the explicit owner authorization: without it the entry is
+    a friend, keeps the source's group/conversation/project grants, loses every
+    owner_private scope and gets one private scope of its own.
+    """
     payload = read_shared_payload(root)
     if (source.agent_id, source.test_mode) != (payload["agent_id"], payload["test_mode"]):
         raise HermesIdentityError("installation agent_id or test_mode differs from the shared store's")
     record = shared_entry_record(
-        source, entry_id=entry_id, display_name=display_name, attached_at=now, python_executable=python_executable
+        source,
+        entry_id=entry_id,
+        display_name=display_name,
+        attached_at=now,
+        python_executable=python_executable,
+        store=payload,
+        protected_scope_ids=store_owner_private_scopes(payload),
+        store_owner=store_owner,
     )
-    return attach_shared_record(root, record, now=now)
+    return attach_shared_record(root, record, now=now, reject_owner_private_conflict=not store_owner)
 
 
-def attach_shared_record(root: Path | str, record: dict[str, Any], *, now: str) -> InstallationManifest:
+def attach_shared_record(
+    root: Path | str,
+    record: dict[str, Any],
+    *,
+    now: str,
+    reject_owner_private_conflict: bool = False,
+) -> InstallationManifest:
     """Make ``record``'s home an entry of the shared store at ``root``.
 
     Everything is checked before anything is written.  Then the store (its
@@ -404,6 +637,13 @@ def attach_shared_record(root: Path | str, record: dict[str, Any], *, now: str) 
     """
     store = Path(str(root)).expanduser().resolve()
     payload = read_shared_payload(store)
+    store_owner = record.get("store_owner") is True or record.get("host") in CLIENT_HOSTS
+    replaced = next((entry for entry in payload["entries"] if entry["entry_id"] == record["entry_id"]), None)
+    replaced_owner_scopes = _entry_owner_private_scopes(replaced) if replaced is not None else frozenset()
+    protected = store_owner_private_scopes(payload, exclude_entry=record["entry_id"])
+    record = narrow_shared_record(record, protected, store_owner=store_owner)
+    if reject_owner_private_conflict and record.get("host") == "hermes":
+        _assert_no_owner_private_conflict(payload, record)
     home = Path(record["home"])
     for entry in payload["entries"]:
         if (
@@ -416,12 +656,32 @@ def attach_shared_record(root: Path | str, record: dict[str, Any], *, now: str) 
             raise HermesIdentityError("entry_id is already attached from another home")
         if entry["entry_id"] != record["entry_id"] and _same_path(entry["home"], home) and not entry.get("detached_at"):
             raise HermesIdentityError("home is already attached as another entry")
+    others = [entry for entry in payload["entries"] if entry["entry_id"] != record["entry_id"]]
+    still_protected = _entry_owner_private_scopes(record)
+    for entry in others:
+        still_protected |= _entry_owner_private_scopes(entry)
+    # A replaced entry's owner scope can lose its last declaration.  Clean every
+    # remaining row that still names it before it stops being protected.
+    retired = replaced_owner_scopes - still_protected
+    if retired:
+        narrowed: list[dict[str, Any]] = []
+        for entry in others:
+            try:
+                narrowed.append(narrow_shared_record(entry, retired, store_owner=_record_is_store_owner(entry)))
+            except HermesIdentityError as exc:
+                raise HermesIdentityError(
+                    f"re-attaching {record['entry_id']} cannot safely narrow entry {entry['entry_id']}: {exc}; "
+                    "detach or re-attach that entry before this one"
+                ) from exc
+        others = narrowed
+    entries = [*others, record]
+    # The store's scope set is exactly its entries' scopes: a replaced entry can retire one.
     before = frozenset(payload["scope_ids"])
-    after = before | frozenset(record["scope_ids"])
+    after = frozenset(scope for entry in entries for scope in entry["scope_ids"])
     updated = _checked_shared_payload(
         {
             **payload,
-            "entries": [entry for entry in payload["entries"] if entry["entry_id"] != record["entry_id"]] + [record],
+            "entries": entries,
             "scope_ids": sorted(after),
         }
     )

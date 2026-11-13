@@ -15,7 +15,7 @@ How it runs:
     documented rebuild path (respace-embeddings into a new space, then worker passes).
   * No host, no network, no API key.  The only stand-ins are the two model seams:
     a stub consolidation model that proposes one fixed claim per known sentence, and a
-    deterministic hashed bag-of-words embedder.  Both are in this file.
+    deterministic hashed bag-of-stemmed-words embedder.  Both are in this file.
   * Every run starts from an empty temp directory and deletes it afterwards.
 
 Usage, against an installed release (expected_answers.json is read from beside this file):
@@ -47,6 +47,7 @@ from pathlib import Path
 
 from scope_recall.contracts import ContractError, InstanceBinding, TrustedContext
 from scope_recall.core import CoreConfig, MemoryCore
+from scope_recall.core.claims import Qualification
 from scope_recall.core.recall_policy import RecallPolicy
 from scope_recall.runtime.lance_port import LanceEmbedPort, LancePurgePort, LanceVectorPort
 
@@ -58,8 +59,8 @@ from scope_recall.vector.store import build_vector_store
 
 HERE = Path(__file__).resolve().parent
 SCOPE = "repro-scope"
-SPACE_1 = hashlib.sha256(b"repro hashed bag-of-words space 1").hexdigest()
-SPACE_2 = hashlib.sha256(b"repro hashed bag-of-words space 2").hexdigest()
+SPACE_1 = hashlib.sha256(b"repro hashed stemmed bag-of-words space 1").hexdigest()
+SPACE_2 = hashlib.sha256(b"repro hashed stemmed bag-of-words space 2").hexdigest()
 DIMS = 64
 #: The hashed embedder is crude, so its admission threshold is lower than a real model's 0.653 / 0.70.
 VECTOR_THRESHOLD = 0.30
@@ -68,10 +69,27 @@ VECTOR_THRESHOLD = 0.30
 # ---------------------------------------------------------------- deterministic model seams
 
 
+def _stem(token: str) -> str:
+    """Fold common English suffixes so a verb and its gerund share one hashed dimension."""
+    if len(token) > 5 and token.endswith("ing"):
+        token = token[:-3]
+    elif len(token) > 4 and token.endswith("ed"):
+        token = token[:-2]
+    elif len(token) > 4 and token.endswith("es"):
+        token = token[:-2]
+    elif len(token) > 4 and token.endswith("s") and not token.endswith("ss"):
+        token = token[:-1]
+    if len(token) > 3 and token.endswith("e"):
+        token = token[:-1]
+    return token
+
+
 def _vector(text: str) -> list[float]:
-    """Hashed bag of words, L2 normalised.  Same text, same vector, on every machine."""
+    """Hashed bag of stemmed words, L2 normalised.  Same text, same vector, on every machine."""
     out = [0.0] * DIMS
     for tok in re.findall(r"[a-z0-9]+", text.lower()):
+        if tok.isalpha():
+            tok = _stem(tok)
         h = int.from_bytes(hashlib.sha256(tok.encode()).digest()[:4], "big")
         out[h % DIMS] += 1.0 if (h >> 31) & 1 else -1.0
     norm = math.sqrt(sum(v * v for v in out))
@@ -91,6 +109,11 @@ class Embedder:
         return _vector(query)
 
 
+def proposed_qualification(reason: str) -> Qualification:
+    """The qualification a C2 candidate carries until an evaluation decides it."""
+    return Qualification("proposed", "inferred_suggestion", reason)
+
+
 #: The stub "model": for each known sentence, the one claim a careful extractor would propose.
 #: It proposes the same kind of claim for the assistant's sentence as for the person's.
 KNOWN_SENTENCES = {
@@ -101,16 +124,17 @@ KNOWN_SENTENCES = {
 
 
 class StubConsolidation:
-    def __init__(self):
+    def __init__(self, claims_by_sentence=None):
         self.calls = 0
+        self.claims_by_sentence = KNOWN_SENTENCES if claims_by_sentence is None else claims_by_sentence
 
     def propose(self, sources, *, episode_ref=None, remaining_seconds=1.0, validation_feedback=None):
         self.calls += 1
         claims = []
         for s in sources:
             text = s.event.get("content") or ""
-            if text in KNOWN_SENTENCES:
-                subject, predicate, value = KNOWN_SENTENCES[text]
+            if text in self.claims_by_sentence:
+                subject, predicate, value = self.claims_by_sentence[text]
                 claims.append(
                     dict(
                         kind="fact",
@@ -139,11 +163,20 @@ class StubConsolidation:
 
 
 class Harness:
-    def __init__(self, root: Path):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        scopes: frozenset[str] = frozenset({SCOPE}),
+        project_id: str = "orchard",
+        model=None,
+    ):
         self.root = root
-        self.binding = InstanceBinding("repro-agent", "repro-install", root / "store", frozenset({SCOPE}))
+        self.scopes = scopes
+        self.project_id = project_id
+        self.binding = InstanceBinding("repro-agent", "repro-install", root / "store", scopes)
         self.n = 0
-        self.model = StubConsolidation()
+        self.model = StubConsolidation() if model is None else model
         self.embedder = Embedder()
         self.store = None
         self.open(SPACE_1)
@@ -175,10 +208,24 @@ class Harness:
             retrieval_policy=RecallPolicy(vector_threshold=VECTOR_THRESHOLD, embedding_space_id=space),
         )
 
-    def ctx(self, session: str, origin: str = "human_direct") -> TrustedContext:
-        return TrustedContext(self.binding, session, frozenset({SCOPE}), origin, project_id="orchard", branch_id="main")
+    def ctx(self, session: str, origin: str = "human_direct", scopes: frozenset[str] | None = None) -> TrustedContext:
+        return TrustedContext(
+            self.binding,
+            session,
+            self.scopes if scopes is None else scopes,
+            origin,
+            project_id=self.project_id,
+            branch_id="main",
+        )
 
-    def say(self, session: str, text: str, origin: str = "human_direct", when: str = "2026-10-01T09:00:00Z"):
+    def say(
+        self,
+        session: str,
+        text: str,
+        origin: str = "human_direct",
+        when: str = "2026-10-01T09:00:00Z",
+        scope_id: str = SCOPE,
+    ):
         self.n += 1
         role = {"human_direct": "user", "assistant_visible": "assistant", "tool_observation": "tool"}[origin]
         event = dict(
@@ -194,7 +241,7 @@ class Harness:
             capture_state="complete",
             evidence_refs=[],
         )
-        receipt = self.core.record_event(self.ctx(session, origin), event, scope_id=SCOPE, remaining_seconds=10)
+        receipt = self.core.record_event(self.ctx(session, origin), event, scope_id=scope_id, remaining_seconds=10)
         return self.core.source(self.ctx(session), receipt.event_refs[0].ref, 1)
 
     def drain(self, ctx, rounds: int = 8) -> int:
@@ -238,17 +285,30 @@ class Harness:
         )
 
     # reads ----------------------------------------------------------------
-    def recall(self, ctx, query: str) -> dict:
+    def recall(
+        self,
+        ctx,
+        query: str,
+        *,
+        mode: str = "current",
+        as_of: str | None = None,
+        max_items: int = 8,
+        focus_refs: tuple[str, ...] = (),
+    ) -> dict:
         """An explicit lookup, as the recall tool makes it: no ambient background stands in for evidence."""
         self.n += 1
         request = dict(
             protocol_version="1.1",
             request_id=f"q{self.n}",
             query=query,
-            mode="current",
-            max_items=8,
+            mode=mode,
+            max_items=max_items,
             budget_tokens=4000,
         )
+        if as_of is not None:
+            request["as_of"] = as_of
+        if focus_refs:
+            request["focus_refs"] = list(focus_refs)
         return dict(self.core.recall_packet(ctx, request, deadline_seconds=10, background_without_evidence=False))
 
     def companion_dump(self) -> str:

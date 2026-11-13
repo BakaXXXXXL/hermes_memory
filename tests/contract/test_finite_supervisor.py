@@ -13,12 +13,33 @@ from pathlib import Path
 import pytest
 from scope_recall.contracts import InstanceBinding, TrustedContext
 from scope_recall.core import CoreConfig, MemoryCore
-from scope_recall.runtime.instance_config import RuntimeInstanceConfig
+from scope_recall.runtime.instance_config import RuntimeInstanceConfig, VectorRuntimeConfig
 from scope_recall.runtime.scheduling import SupervisorControl, next_wake, supervise
+from scope_recall.runtime.vector_retention import (
+    PASS_INTERVAL,
+    RETRY_BACKOFF,
+    retention_key,
+    write_backoff,
+    write_state,
+)
 from scope_recall.runtime.worker_entry import DAILY_COUNTER_MAX, _reserve_daily_work
 from v11_support import source_event
 
 NOW = datetime(2026, 9, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _stamp(value):
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def _retention_key(config, days):
+    return retention_key(
+        installation_id=config.binding.installation_id,
+        project_id=config.project_id,
+        branch_id=config.branch_id,
+        scope_ids=config.allowed_scope_ids,
+        days=days,
+    )
 
 
 def fixture(tmp_path, **settings):
@@ -109,6 +130,101 @@ def test_next_due_preserves_audience_cooldown_budget_and_purge(tmp_path):
         tx._check(write=True).execute("UPDATE work_items SET state='failed',last_error_code='invalid_derivation'")
     plan = next_wake(cfg, now=NOW)
     assert plan.due_at is None and plan.reason == "failed_terminal" and plan.failed > 0
+
+
+def test_retention_due_wakes_the_worker_at_its_recorded_hour(tmp_path):
+    """Retention lives outside the work queue.  With nothing queued, its due time is the only reason to wake a
+    worker; an hour after the last pass it is not due, so the five-minute timer launches nothing."""
+    _core, cfg, _ = fixture(tmp_path)
+    vector = VectorRuntimeConfig(
+        backend="sqlite-bruteforce",
+        storage_dir=tmp_path / "vectors",
+        table_name="TEST-vectors",
+        dimensions=1,
+        test_injection_override=True,
+        tool_output_retention_days=60,
+    )
+    configured = replace(cfg, vector=vector)
+    due = _stamp(NOW)
+    plan = next_wake(configured, now=NOW)
+    assert (plan.reason, plan.due_at, plan.pending) == ("vector_retention", due, 0)
+    write_state(vector.storage_dir, _retention_key(configured, 60), {"retention_days": 60, "finished_at": due})
+    later = NOW + timedelta(minutes=5)
+    plan = next_wake(configured, now=later)
+    assert (plan.reason, plan.due_at) == (
+        "vector_retention",
+        (NOW + PASS_INTERVAL).isoformat().replace("+00:00", "Z"),
+    )
+    assert next_wake(configured, now=NOW + PASS_INTERVAL).reason == "vector_retention"
+    off = replace(configured, vector=replace(vector, tool_output_retention_days=0))
+    assert next_wake(off, now=later).due_at is None
+
+
+def test_retention_backoff_holds_the_wake_past_the_five_minute_tick(tmp_path):
+    """A nine-second drain may not leave the retention reserve; the retry time it records, not the timer tick,
+    decides the next wake."""
+    _core, cfg, _ = fixture(tmp_path)
+    vector = VectorRuntimeConfig(
+        backend="sqlite-bruteforce",
+        storage_dir=tmp_path / "vectors",
+        table_name="TEST-vectors",
+        dimensions=1,
+        test_injection_override=True,
+        tool_output_retention_days=60,
+    )
+    configured = replace(cfg, vector=vector, drain_seconds=9.0)
+    key = _retention_key(configured, 60)
+    assert next_wake(configured, now=NOW).due_at == _stamp(NOW)
+    until = NOW + RETRY_BACKOFF
+    assert write_backoff(configured.binding.data_directory, key, until=until, reason="insufficient_budget")
+    plan = next_wake(configured, now=NOW + timedelta(minutes=5))
+    assert (plan.reason, plan.due_at) == ("vector_retention", _stamp(until))
+    assert next_wake(configured, now=until).due_at == _stamp(until)
+
+
+def test_two_entries_keep_separate_retention_records_for_the_same_store(tmp_path):
+    """Two entries sharing a vector directory write and read their own partition record: one entry's pass, or a
+    different window, neither starves nor re-wakes the other."""
+    _core, cfg, _ = fixture(tmp_path)
+    vector = VectorRuntimeConfig(
+        backend="sqlite-bruteforce",
+        storage_dir=tmp_path / "vectors",
+        table_name="TEST-vectors",
+        dimensions=1,
+        test_injection_override=True,
+        tool_output_retention_days=60,
+    )
+    first = replace(cfg, allowed_scope_ids=frozenset({"TEST-a"}), vector=vector)
+    second = replace(
+        cfg, allowed_scope_ids=frozenset({"TEST-b"}), vector=replace(vector, tool_output_retention_days=180)
+    )
+    first_key = _retention_key(first, 60)
+    second_key = _retention_key(second, 180)
+    assert first_key != second_key
+    later = NOW + timedelta(minutes=5)
+    write_state(vector.storage_dir, first_key, {"retention_days": 60, "finished_at": _stamp(NOW)})
+    assert next_wake(first, now=later).due_at == _stamp(NOW + PASS_INTERVAL)
+    # The other entry's different window is not suppressed by the first entry's record.
+    assert next_wake(second, now=later).due_at == _stamp(later)
+    write_state(vector.storage_dir, second_key, {"retention_days": 180, "finished_at": _stamp(NOW)})
+    # Neither record invalidates the other, so neither entry loops on the other's window.
+    assert next_wake(first, now=later).due_at == _stamp(NOW + PASS_INTERVAL)
+    assert next_wake(second, now=later).due_at == _stamp(NOW + PASS_INTERVAL)
+    # A same-window entry over the same scopes is the same partition and shares its record; another
+    # scope is a partition of its own.
+    twin = replace(first, session_id="TEST-twin", owner_id="TEST-twin-worker")
+    assert _retention_key(twin, 60) == first_key
+    same_window = replace(second, vector=replace(vector, tool_output_retention_days=60))
+    assert _retention_key(same_window, 60) != first_key
+    write_state(vector.storage_dir, _retention_key(same_window, 60), {"retention_days": 60, "finished_at": _stamp(NOW)})
+    assert next_wake(same_window, now=later).due_at == _stamp(NOW + PASS_INTERVAL)
+    # The same scopes with another window are a different record too: neither invalidates the other.
+    other_window = replace(first, vector=replace(vector, tool_output_retention_days=180))
+    other_key = _retention_key(other_window, 180)
+    assert other_key != first_key
+    write_state(vector.storage_dir, other_key, {"retention_days": 180, "finished_at": _stamp(NOW)})
+    assert next_wake(first, now=later).due_at == _stamp(NOW + PASS_INTERVAL)
+    assert next_wake(other_window, now=later).due_at == _stamp(NOW + PASS_INTERVAL)
 
 
 def test_an_inbox_row_a_replay_will_store_wakes_the_worker(tmp_path):

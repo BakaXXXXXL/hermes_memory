@@ -1,0 +1,88 @@
+{
+  "_about": "Regression oracle for retrieval_quality_eval.py. Each metric and semantic result was reviewed against the retrieval contract and the named case, not accepted merely because a run produced it. A case is matched only by the packet kind that can answer it, and per-case positions and packet counts are diagnostics, so incidental packet shape is not pinned here. The deterministic embedder folds common English suffixes so a verb and its gerund share one token; ranking is not decided by hash noise.",
+  "_reviewed_against": [
+    "current claims are served before their raw evidence",
+    "history and as_of label the old claim historical; the current head stays current",
+    "same-source revision 2 replaces revision 1 in current mode",
+    "a cross-scope query returns no_match with no claim or vector item",
+    "a tool-only proposal waits for evidence with no_derivation_root and stays proposed",
+    "a human-backed candidate is evaluated and becomes an active claim",
+    "a related production-port claim does not take the first slot for a staging-port question",
+    "the paraphrase of the staging-port question also keeps the production-port claim behind the gold claim"
+  ],
+  "metrics": {
+    "overall": {
+      "cases": 13,
+      "hit_at_1": 0.692308,
+      "hit_at_3": 0.923077,
+      "hit_at_6": 1.0,
+      "mrr": 0.807692
+    },
+    "claim": {
+      "cases": 7,
+      "hit_at_1": 0.714286,
+      "hit_at_3": 0.857143,
+      "hit_at_6": 1.0,
+      "mrr": 0.809524
+    },
+    "evidence": {
+      "cases": 6,
+      "hit_at_1": 0.666667,
+      "hit_at_3": 1.0,
+      "hit_at_6": 1.0,
+      "mrr": 0.805556
+    },
+    "tool_origin_ratio": 0.052632
+  },
+  "semantics": {
+    "old_claim_history_present": true,
+    "old_claim_history_status": "historical",
+    "old_claim_history_revision": 1,
+    "current_head_present": true,
+    "current_head_status": "current",
+    "current_head_revision": 2,
+    "current_old_claim_present": false,
+    "history_current_claim_status": "current",
+    "as_of_old_claim_present": true,
+    "as_of_old_claim_status": "historical",
+    "as_of_current_claim_present": false,
+    "freshness_current_value": "green",
+    "freshness_current_revision": 2,
+    "freshness_current_old_present": false,
+    "freshness_history_old_present": true,
+    "freshness_history_old_status": "historical",
+    "no_answer_status": "no_match",
+    "no_answer_answerability": "unknown",
+    "no_answer_items": 0
+  },
+  "precision": {
+    "production_distractor_at_1": false,
+    "production_distractor_before_gold": false,
+    "paraphrase_production_distractor_before_gold": false,
+    "payroll_property_visible": false
+  },
+  "cross_scope": {
+    "companion_rows_present": true,
+    "allowed_claim_visible": true,
+    "restricted_question_status": "no_match",
+    "restricted_question_answerability": "unknown",
+    "restricted_question_items": 0,
+    "restricted_exact_status": "no_match",
+    "restricted_exact_items": 0,
+    "empty_scopes_error": "ACCESS_DENIED"
+  },
+  "tool": {
+    "stub_proposes_tool_claim": true,
+    "candidate_work_queued": false,
+    "candidate_evaluations": 0,
+    "candidate_processing_state": "waiting_evidence",
+    "candidate_reason": "no_derivation_root",
+    "claim_state": "proposed",
+    "active_tool_claim_items": 0,
+    "proposed_tool_claim_items": 1,
+    "human_control_candidate_work_queued": true,
+    "human_control_candidate_evaluations": 1,
+    "human_control_claim_state": "active",
+    "human_control_claim_recalled": true
+  }
+}

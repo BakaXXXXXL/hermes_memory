@@ -68,6 +68,7 @@ def entry(tmp_path, monkeypatch):
         entry_id="tianshu",
         display_name="天枢",
         now=NOW,
+        store_owner=True,
     )
     owner = next(row for row in read_shared_payload(root)["entries"][0]["audiences"] if row["kind"] == "owner_private")
     home = tmp_path / "TEST-workbuddy-home"

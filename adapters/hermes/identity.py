@@ -19,7 +19,13 @@ from scope_recall.contracts import (
 )
 
 from ...runtime.worker_launch import RUNTIME_CONFIG_FILENAME
-from .audiences import LOCAL_PLATFORMS, LOCAL_USER_ID, approved_local_platforms
+from .audiences import (
+    LOCAL_PLATFORMS,
+    LOCAL_USER_ID,
+    approved_local_platforms,
+    canonical_chat_type,
+    owner_private_scope_ids,
+)
 from .installation import (
     SCHEMA_VERSION,
     HermesIdentityError,
@@ -58,8 +64,13 @@ def _scope_component(label: str, value: str) -> str:
 
 
 def _normalize_platform(value: object) -> str:
-    text = str(value or "cli").strip().lower()
-    return text or "cli"
+    """The host's platform as sent; a missing one is not the CLI.
+
+    Hermes always names the surface a session is on.  Defaulting an absent
+    platform to ``cli`` made every caller that forgot it the local owner, with
+    the CLI's owner_private scope.  An explicit ``cli`` still binds as before.
+    """
+    return str(value or "").strip().lower()
 
 
 def _normalize_user_id(
@@ -86,7 +97,7 @@ def _normalize_user_id(
 
 
 def _normalize_chat_type(value: object) -> str:
-    return str(value or "").strip().lower()
+    return canonical_chat_type(value)
 
 
 def _matches_owner_principal(manifest: InstallationManifest, *, platform: str, user_id: str) -> bool:
@@ -309,11 +320,19 @@ def _route_matches(row: Mapping[str, object], route: Mapping[str, str]) -> bool:
     exact empty key would fail every gateway route closed.  A row that names a key still
     matches only that key.  The CLI sends none, so a CLI row is never relaxed: Hermes reports a
     relayed ``local`` gateway session to plugins as ``cli``, with its key, and that is not the CLI.
+
+    ``dm``, ``direct`` and ``private`` are one chat type: the host names the same one-to-one
+    chat differently by platform, and a row written with another spelling still means it.
     """
     unpinned = row.get("gateway_session_key") == "" and route.get("platform") != "cli"
-    return all(
-        row.get(field) == value or (field == "gateway_session_key" and unpinned) for field, value in route.items()
-    )
+    for field, value in route.items():
+        if field == "chat_type":
+            matched = canonical_chat_type(row.get(field)) == canonical_chat_type(value)
+        else:
+            matched = row.get(field) == value or (field == "gateway_session_key" and unpinned)
+        if not matched:
+            return False
+    return True
 
 
 def resolve_runtime_audience(manifest: InstallationManifest, scope: HermesRuntimeScope) -> RuntimeAudience:
@@ -321,15 +340,18 @@ def resolve_runtime_audience(manifest: InstallationManifest, scope: HermesRuntim
 
     Audience rows are deliberately not wildcards.  In particular, a group is
     allowed only the conversation/project scopes explicitly bound to that
-    group, so another group or a private chat cannot inherit its scopes.
+    group, so another group or a private chat cannot inherit its scopes.  An
+    owner_private row is checked against the owner principals, and no other
+    kind of row may carry an owner-private scope: a migrated or hand-written
+    manifest cannot turn a friend's matching chat into the owner's memory.
     """
 
     if manifest.schema_version != SCHEMA_VERSION:
         raise HermesIdentityError("explicit v3 audience upgrade required")
     gaps: list[str] = []
-    owner_private_scope = manifest.audience_scopes.get("owner_private")
-    if not owner_private_scope:
-        return RuntimeAudience(frozenset(), None, ("capability_gap:owner_private_unconfigured",), False)
+    owner_private_scope = manifest.audience_scopes.get("owner_private", "")
+    protected = set(manifest.protected_scope_ids)
+    protected |= owner_private_scope_ids(manifest.audience_scopes, manifest.audiences)
     owner_verified = _matches_owner_principal(manifest, platform=scope.platform, user_id=scope.user_id)
 
     exact_fields = {
@@ -350,19 +372,30 @@ def resolve_runtime_audience(manifest: InstallationManifest, scope: HermesRuntim
     for row in matches:
         kind = str(row.get("kind") or "conversation")
         if kind == "owner_private" and not owner_verified:
+            # The row names a route the installer declared private to an owner,
+            # but this session is not that principal.  Say so and grant nothing.
+            gaps.append("capability_gap:owner_private_not_owner")
             continue
-        allowed.update(
+        row_allowed = {
             scope_id
             for scope_id in row["allowed_scope_ids"]
             if scope_id in manifest.scope_ids
             and scope_id not in archive_scopes
             and scope_id not in manifest.retained_scope_ids
             and not is_archive_scope(scope_id)
-        )
-        writable.update(scope_id for scope_id in row.get("writable_scope_ids", ()) if scope_id in allowed)
+        }
+        row_writable = {scope_id for scope_id in row.get("writable_scope_ids", ()) if scope_id in row_allowed}
+        if kind != "owner_private":
+            narrowed_allowed = row_allowed - protected
+            narrowed_writable = row_writable - protected
+            if narrowed_allowed != row_allowed or narrowed_writable != row_writable:
+                gaps.append("capability_gap:owner_private_scope_denied")
+            row_allowed, row_writable = narrowed_allowed, narrowed_writable
+        allowed.update(row_allowed)
+        writable.update(row_writable)
         if capture_scope is None:
             cand = str(row["capture_scope_id"])
-            if cand in writable:
+            if cand in row_writable:
                 capture_scope = cand
         if kind == "owner_private":
             includes_owner_private = True
@@ -381,7 +414,7 @@ def resolve_runtime_audience(manifest: InstallationManifest, scope: HermesRuntim
             gaps.append(f"capability_gap:audience_thread_mismatch:row_says_{near[0].get('thread_id') or 'empty'}")
     elif not allowed:
         gaps.append("capability_gap:owner_unverified")
-    if not includes_owner_private and owner_private_scope not in allowed:
+    if owner_private_scope and not includes_owner_private and owner_private_scope not in allowed:
         gaps.append("capability_gap:owner_private_denied")
     if not allowed:
         gaps.append("capability_gap:no_allowed_scope")
@@ -409,17 +442,25 @@ def _hermes_home(session_id: object, kwargs: dict) -> Path:
 
 
 def _agent_fields(kwargs: dict, manifest) -> tuple[str, str, str]:
-    """The agent's identity (the installation's own), workspace and context (primary or a supported other)."""
-    agent_identity = str(kwargs.get("agent_identity") or "").strip()
+    """The agent's identity (the installation's own), workspace and context (primary or a supported other).
+
+    A shared store is one installation that several Hermes profiles attach to, so the
+    host names the profile it runs while the store keeps the manifest's ``agent_id``.
+    The core binds the store's identity; only a local installation, whose manifest is
+    the host's own, treats a different name as a conflict.
+    """
+    host_identity = str(kwargs.get("agent_identity") or "").strip()
     agent_workspace = str(kwargs.get("agent_workspace") or "default").strip() or "default"
     agent_context = str(kwargs.get("agent_context") or "primary").strip() or "primary"
     if agent_context not in {"primary", *sorted(_NON_PRIMARY_CONTEXTS)}:
         raise HermesIdentityError(f"unsupported agent_context: {agent_context}")
-    if not agent_identity:
+    if not host_identity:
         raise HermesIdentityError("agent_identity is required")
-    if agent_identity != manifest.agent_id:
+    if manifest.installation_kind == "shared":
+        return manifest.agent_id, agent_workspace, agent_context
+    if host_identity != manifest.agent_id:
         raise HermesIdentityError("agent_identity conflict")
-    return agent_identity, agent_workspace, agent_context
+    return host_identity, agent_workspace, agent_context
 
 
 def _chat_route(platform: str, user_id: str, local_platforms, kwargs: dict) -> tuple[str, str, str]:
@@ -466,6 +507,8 @@ def bind_hermes_identity(session_id: str, **kwargs: object) -> HermesIdentity:
         raise HermesIdentityError("session_id is required")
 
     platform = _normalize_platform(kwargs.get("platform"))
+    if not platform:
+        raise HermesIdentityError("platform is required; a session that names none is not the CLI owner")
     local_platforms = approved_local_platforms(manifest.owner_principals)
     user_id = _normalize_user_id(platform, kwargs.get("user_id"), kwargs.get("user_id_alt"), local_platforms)
     agent_identity, agent_workspace, agent_context = _agent_fields(kwargs, manifest)
@@ -486,7 +529,7 @@ def bind_hermes_identity(session_id: str, **kwargs: object) -> HermesIdentity:
     binding = manifest.to_binding()
     assert_binding_matches_manifest(binding, manifest)
     parent_session_id = str(kwargs.get("parent_session_id") or "").strip()
-    owner_private_scope_id = manifest.audience_scopes["owner_private"]
+    owner_private_scope_id = manifest.audience_scopes.get("owner_private", "")
     return HermesIdentity(
         hermes_home=hermes_home,
         session_id=session_id,

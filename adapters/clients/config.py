@@ -27,6 +27,7 @@ from scope_recall.adapters.hermes.shared_entries import (
 )
 from scope_recall.contracts import InstanceBinding
 from scope_recall.core import CoreConfig, MemoryCore
+from scope_recall.core.admission import BASIC_CORE_ADMISSION
 from scope_recall.runtime.worker_launch import RUNTIME_CONFIG_FILENAME
 
 
@@ -295,6 +296,6 @@ def install_codex_scope_recall(
     )
     write_codex_config(config)
     binding = config.to_binding()
-    core = MemoryCore(CoreConfig(binding), clock=clock)
+    core = MemoryCore(CoreConfig(binding, admission_policy=BASIC_CORE_ADMISSION), clock=clock)
     core.initialize()
     return config, core

@@ -28,9 +28,19 @@ The store's id is drawn once, when the store is made, and is not a path. A copie
 nowhere until `adopt` records its new directory; opening it before that fails with
 `store_moved:run_adopt`.
 
-Each entry keeps the grants its own installation had: the same audience rows, so every chat
-reaches the same scopes it reached before. Entries meet where their scopes are the same
-strings, which for installations migrated from 2.x includes the owner's private scopes.
+Each entry keeps the grants its own installation had, narrowed by whether it is the owner or a
+friend (see [Owner and friend entries](#owner-and-friend-entries)): every chat still reaches the
+scopes it reached before, except that a friend does not carry the owner's private scopes. Owner
+entries meet where their scopes are the same strings, which for installations migrated from 2.x
+includes the owner's private scopes.
+
+Tool-output vector retention keeps one state record per entry/project/branch/scope partition and
+window under `vectors\<space>\retention-state.json`, so one entry's hourly pass does not delay
+another's, and a different entry, project, branch, scope set or `tool_output_retention_days` is a
+different record. A pass that cannot run records a 15-minute retry in the worker's data
+directory; the scheduled wake waits for it instead of starting a worker every five minutes. A
+drain over several partitions reports `partial` when some succeeded and some failed, names the
+failed partitions in `errors`, and holds each failed partition's own retry.
 
 ## Make a store and attach the first agent
 
@@ -42,20 +52,25 @@ scope-recall init-shared --root D:\ScopeRecall\shared
 ```
 
 To attach a Hermes instance that has its own store today, stop its gateway first (and its
-worker: `autostart pause`), then move its `scope-recall` directory aside and attach:
+worker: `autostart pause`), then move its `scope-recall` directory aside and attach. The store's
+owner must say so explicitly and carry that installation's grants over:
 
 ```text
 scope-recall backup --database <home>\scope-recall\memory.sqlite3 --output <backup-dir>\memory.sqlite3
 ren <home>\scope-recall scope-recall.local-20260922
 scope-recall attach --host hermes --instance-root <home> --root D:\ScopeRecall\shared ^
     --entry desk --display-name Desk ^
+    --store-owner ^
     --grants-from <home>\scope-recall.local-20260922\installation.json ^
     --runtime-config-from <home>\scope-recall.local-20260922\runtime-config.json
 ```
 
-`--grants-from` carries over that installation's audience rows and owner principals, unchanged.
-Without it the entry gets a fresh installation's grants: the CLI only. The old store stays where
-you moved it; its memories are not copied into the shared store.
+`--store-owner` is the explicit authorization to keep that installation's owner-private
+scopes. A friend attaches with the same `--grants-from` and without `--store-owner`: it keeps
+the installation's group, conversation and project grants, loses every carried-over
+owner-private scope, and gets one private scope named after its entry. Without `--grants-from`
+the entry gets a fresh installation's grants: the CLI only. The old store stays where you moved
+it; its memories are not copied into the shared store.
 
 `--runtime-config-from` gives the entry its model routes, bound to the shared store and to the
 worker's vector table, with the entry's spend ledger beside its pointer. The first entry attached
@@ -80,6 +95,42 @@ removed; the shared store's worker does all background work.
 
 Attaching another agent later adds its scopes to the store. Agents already running keep working
 without a restart.
+
+## Owner and friend entries
+
+A shared store's owner is the entry attached from the installation that owns its private
+memory: it must pass both `--store-owner` and `--grants-from <archived installation.json>`, and
+its record says `store_owner: true`. A friend entry is attached from
+another installation, or from a home with no installation of its own; it passes `--grants-from`
+when it has one and never `--store-owner`, and its record says `store_owner: false`. A friend
+keeps the group, conversation and project grants of its old installation but not its
+owner-private rows, and gets a private scope of its own instead.
+
+A client entry (`--host codex`, `claude-code`, `workbuddy` or `dsh`) takes `--grants-like` grants
+only from owner entries; `--store-owner` is refused for a client. A friend's private scope is
+never taken, even if an owner row names it, and a conversation, group or project row cannot
+grant an owner-private scope at bind time. An entry record written before this release has no
+`store_owner` field and is still read as an owner, so a store is not ready for `--grants-like
+all` until its old friend entries are re-attached.
+
+### Re-attaching an entry
+
+`attach` with an existing entry id replaces that entry's record with the one built from the
+archive and the flags of this run. Re-attach an old friend with its archived `installation.json`
+and `--grants-from`, without `--store-owner`, before attaching a client with `--grants-like all`
+or naming that entry in `--grants-like`. Re-attach the owner with `--store-owner --grants-from`:
+omitting `--store-owner` turns it into a friend, drops its owner-private grants and gives it a
+new entry-named private scope. Passing `--store-owner` for a friend can carry scopes that belong
+to the owner, and `attach` refuses an owner-private conflict. Keep the archived installation
+until the re-attach is verified, and use the same archive the entry was attached from. This
+release does not rewrite existing records in place: a store's entries stay as they are until an
+operator re-attaches them. An entry id cannot be re-attached from a different home while its old
+home still points at this store (`entry_id is already attached from another home`).
+
+A shared store is one installation to the core, so every Hermes profile may send its own
+`agent_identity`; the adapter binds the store's `agent_id` rather than refusing the profile
+name. A session that names no platform is no longer treated as the CLI, and `dm`, `direct` and
+`private` are one chat type.
 
 ## Bringing an agent's memories along
 
@@ -326,6 +377,12 @@ reads and captures; a conversation row beside it is a grant like any other. Memo
 scopes and their entry; only who reads and writes them changes. Whoever can run this can grant
 any route the store's memory, as whoever can write the manifest always could: it is an operator
 command, never a host's.
+
+The owner-private rule still holds at bind time for rows written here: a `conversation`, `group`
+or `project` row that names an owner-private scope grants it to nobody
+(`capability_gap:owner_private_scope_denied`), and a client still takes `--grants-like` grants
+only from entries marked `store_owner: true`. The `store_owner` marker is not part of the grants
+document, so a grants change does not turn a friend into an owner.
 
 ## Detach, and going back
 

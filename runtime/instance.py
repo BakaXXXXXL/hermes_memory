@@ -783,11 +783,16 @@ def build_runtime_instance(
     if not isinstance(config, RuntimeInstanceConfig):
         raise TypeError("config must be RuntimeInstanceConfig")
     auxiliary = build_auxiliary_runtime(config.auxiliary) if config.auxiliary is not None else None
+    consolidation_port = consolidation if consolidation is not None else getattr(auxiliary, "consolidation", None)
     core = MemoryCore(
-        CoreConfig(config.binding, auto_recall_seconds=config.auto_recall_seconds),
+        CoreConfig(
+            config.binding,
+            auto_recall_seconds=config.auto_recall_seconds,
+            admission_policy=config.admission_policy(consolidation_port=consolidation_port),
+        ),
         storage=SQLiteStorage(config.binding),
         vectors=vectors,
-        consolidation=consolidation if consolidation is not None else getattr(auxiliary, "consolidation", None),
+        consolidation=consolidation_port,
         retrieval_policy=config.recall_policy(),
     )
     ingress_authorizer = None

@@ -9,6 +9,7 @@ import sys
 from typing import TYPE_CHECKING, Any
 
 from scope_recall.core import CoreConfig, MemoryCore
+from scope_recall.core.admission import BASIC_CORE_ADMISSION
 
 from .audiences import LOCAL_PLATFORMS
 from .capture import CAPTURE_TIMEOUT_S
@@ -79,7 +80,9 @@ class SessionBinding:
                 )
             self._adapter._core = self._adapter._host_runtime.core
             if self._adapter._core is None:
-                self._adapter._core = MemoryCore(CoreConfig(fresh.binding), clock=self._adapter._clock)
+                self._adapter._core = MemoryCore(
+                    CoreConfig(fresh.binding, admission_policy=BASIC_CORE_ADMISSION), clock=self._adapter._clock
+                )
             else:
                 assert_core_binding_matches(self._adapter._core, fresh.binding)
             # An unknown or unconfigured audience is a valid fail-closed

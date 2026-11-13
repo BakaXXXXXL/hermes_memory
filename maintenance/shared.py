@@ -41,14 +41,13 @@ from ..adapters.hermes.installation import (
     MANIFEST_FILENAME,
     HermesIdentityError,
     InstallationManifest,
-    build_installation_manifest,
+    build_shared_entry_manifest,
     load_archived_installation,
 )
 from ..adapters.hermes.shared_entries import (
     CLIENT_HOSTS,
     ENTRY_HOSTS,
     GRANTS_SCHEMA,
-    attach_shared_entry,
     attach_shared_record,
     attachment_path,
     client_entry_record,
@@ -58,6 +57,7 @@ from ..adapters.hermes.shared_entries import (
     read_shared_payload,
     regranted,
     shared_entry_record,
+    store_owner_private_scopes,
     write_shared_payload,
 )
 from ..contracts import ContractError, InstanceBinding, TrustedContext
@@ -188,15 +188,20 @@ def _entry_config(
     return out
 
 
-def _client_grants(payload: dict[str, Any], like: tuple[str, ...], capture_like: str) -> tuple[set[str], set[str], str]:
+def _client_grants(
+    payload: dict[str, Any], like: tuple[str, ...], capture_like: str, *, store_owner: bool = False
+) -> tuple[set[str], set[str], str]:
     """What a client entry reads, writes and captures into, taken from attached Hermes entries' owner rows.
 
     It reads what the owner reads through any of ``like`` (``("all",)``: every
     attached Hermes entry), may write where the owner may there, and captures
     where ``capture_like``'s owner captures, which must be a scope every owner
     row of every attached Hermes entry reads: what the owner says in the client
-    reaches every agent, and no Hermes entry's grants change.
+    reaches every agent, and no Hermes entry's grants change.  A non-owner
+    entry's private scope is never taken, even if an owner row names it.
     """
+    if store_owner:
+        raise SharedStoreError("--store-owner is for a Hermes entry carrying an installation's owner grants")
     hermes = {
         entry["entry_id"]: entry
         for entry in payload["entries"]
@@ -207,17 +212,43 @@ def _client_grants(payload: dict[str, Any], like: tuple[str, ...], capture_like:
     if not names or unknown:
         raise SharedStoreError(f"not attached Hermes entries of this store: {', '.join(unknown) or '(none named)'}")
 
+    def is_owner(entry: dict[str, Any]) -> bool:
+        # An entry from before the marker was written is still its owner, so an
+        # existing owner install keeps working; a friend entry from that release
+        # is indistinguishable and needs the documented re-attach.  A malformed
+        # marker is not True, so a fresh friend entry's private scope never
+        # becomes a client's grant.
+        return entry.get("store_owner", True) is True
+
     def owner_rows(name: str) -> list[dict[str, Any]]:
+        if not is_owner(hermes[name]):
+            return []
         return [row for row in hermes[name]["audiences"] if row.get("kind") == "owner_private"]
 
     allowed = {scope for name in names for row in owner_rows(name) for scope in row["allowed_scope_ids"]}
     writable = {scope for name in names for row in owner_rows(name) for scope in row["writable_scope_ids"]}
+    owner_private: set[str] = set()
+    non_owner_private: set[str] = set()
+    for entry in hermes.values():
+        scopes = store_owner_private_scopes({"entries": [entry]})
+        (owner_private if is_owner(entry) else non_owner_private).update(scopes)
+    non_owner_private -= owner_private
+    allowed -= non_owner_private
+    writable -= non_owner_private
     captures = {row["capture_scope_id"] for row in owner_rows(capture_like)}
+    if not captures:
+        raise SharedStoreError(
+            f"{capture_like} has no owner_private grant; a client attaches with the store owner's grants"
+        )
     if len(captures) != 1:
         raise SharedStoreError(
             f"{capture_like}'s owner rows capture into {len(captures)} scopes; name an entry with one"
         )
     capture = next(iter(captures))
+    if capture in non_owner_private:
+        raise SharedStoreError(
+            f"{capture_like}'s capture scope belongs to a non-owner entry; a client takes the store owner's grants"
+        )
     unread = sorted(
         f"{name}:{row['platform']}"
         for name in hermes
@@ -288,9 +319,10 @@ def attach(
     python_executable: Path | None = None,
     grants_like: tuple[str, ...] = (),
     capture_like: str | None = None,
-    now: str | None = None,
+    store_owner: bool = False,
+    **options: Any,
 ) -> dict[str, Any]:
-    now = now or _now()
+    now = options.pop("now", None) or _now()
     payload = read_shared_payload(root)
     python = str(python_executable) if python_executable else None
     if host == "hermes":
@@ -306,14 +338,24 @@ def attach(
         source = (
             load_archived_installation(grants_from, instance_root)
             if grants_from is not None
-            else build_installation_manifest(
+            else build_shared_entry_manifest(
                 instance_root,
                 agent_id=payload["agent_id"],
+                entry_id=entry_id,
                 agent_workspace=DEFAULT_AGENT_WORKSPACE,
                 test_mode=payload["test_mode"],
             )
         )
-        record = shared_entry_record(source, entry_id=entry_id, display_name=display_name, attached_at=now)
+        record = shared_entry_record(
+            source,
+            entry_id=entry_id,
+            display_name=display_name,
+            attached_at=now,
+            python_executable=python,
+            store=payload,
+            protected_scope_ids=store_owner_private_scopes(payload),
+            store_owner=store_owner,
+        )
     elif host in CLIENT_HOSTS:
         if grants_from is not None:
             raise SharedStoreError("a client has no installation to carry grants over from; use --grants-like")
@@ -324,7 +366,7 @@ def attach(
                 f"this home still has its own store: move {CODEX_CONFIG_FILENAME} and data aside "
                 "(for example into local-<date>); the client's memory is then the store's"
             )
-        allowed, writable, capture = _client_grants(payload, grants_like, capture_like)
+        allowed, writable, capture = _client_grants(payload, grants_like, capture_like, store_owner=store_owner)
         record = client_entry_record(
             host=host,
             home=instance_root,
@@ -382,8 +424,11 @@ def attach(
     run.keep(attachment_path(instance_root), "entry")
     run.keep(entry_path, "entry")
     if host == "hermes":
-        view = attach_shared_entry(
-            root, source, entry_id=entry_id, display_name=display_name, now=now, python_executable=python
+        view = attach_shared_record(
+            root,
+            record,
+            now=now,
+            reject_owner_private_conflict=not store_owner,
         )
     else:
         view = attach_shared_record(root, record, now=now)
@@ -405,6 +450,7 @@ def attach(
         "worker_runtime_config": str(worker_path) if worker_config is not None or worker_now is not None else None,
         "worker_runtime_config_written": worker_config is not None,
         "grants_from": str(grants_from) if grants_from is not None else None,
+        "store_owner": bool(store_owner),
         "grants_like": list(grants_like) or None,
         "capture_scope_like": capture_like,
         "ledgers_created": ledgers,
@@ -818,6 +864,7 @@ def entries(*, root: Path) -> dict[str, Any]:
                 "entry_id": record["entry_id"],
                 "display_name": record["display_name"],
                 "host": record["host"],
+                "store_owner": record.get("store_owner", True) is True,
                 "home": record["home"],
                 "attached_at": record.get("attached_at"),
                 "detached_at": record.get("detached_at"),
@@ -851,6 +898,12 @@ def main(argv: list[str]) -> int:
     join.add_argument("--entry", required=True, help="2 to 32 lowercase letters, digits or hyphens")
     join.add_argument("--display-name", required=True, help="the name a reader is shown, at most 32 characters")
     join.add_argument("--grants-from", help="the installation.json of the home's own store, moved aside")
+    join.add_argument(
+        "--store-owner",
+        action="store_true",
+        help="the explicit owner authorization: carry over this installation's owner_private grants; "
+        "without it the entry is a friend and keeps only its non-owner grants and one private scope of its own",
+    )
     join.add_argument(
         "--grants-like",
         help="a client's entry: the attached Hermes entries whose owner grants it gets, comma separated, or all",
@@ -903,6 +956,7 @@ def main(argv: list[str]) -> int:
                 python_executable=_absolute(args.python, "python") if args.python else None,
                 grants_like=tuple(name.strip() for name in (args.grants_like or "").split(",") if name.strip()),
                 capture_like=args.capture_like,
+                store_owner=args.store_owner,
             )
         elif args.command == "detach":
             result = detach(instance_root=_absolute(args.instance_root, "instance_root"))

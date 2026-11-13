@@ -76,6 +76,12 @@ def _resident(argv: list[str]) -> int:
     return main(argv[1:])
 
 
+def _vector_cleanup(argv: list[str]) -> int:
+    from .vector_cleanup import main
+
+    return main(argv[1:])
+
+
 _DELEGATED: dict[str, tuple[str, Callable[[list[str]], int]]] = {
     "setup": ("agent-operated fresh install/update/migration routing", _upgrade_cli),
     "migrate": ("prepare, resume, verify and index a legacy migration job", _upgrade_cli),
@@ -92,6 +98,10 @@ _DELEGATED: dict[str, tuple[str, Callable[[list[str]], int]]] = {
     "entries": ("list a shared store's entries and when each was last heard from", _shared),
     "import-entry": ("copy an entry's own store, moved aside at attach, into its shared store", _shared),
     "resident": ("see or stop an entry's resident prompt recall server, as before a package upgrade", _resident),
+    "vector-cleanup": (
+        "dry-run or apply removal of vectors whose SQLite subject is gone, under a writer lease",
+        _vector_cleanup,
+    ),
 }
 
 

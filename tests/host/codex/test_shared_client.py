@@ -58,6 +58,7 @@ def store(tmp_path):
             entry_id=name,
             display_name=display,
             now=NOW,
+            store_owner=True,
         )
         homes[name] = home
     owner = next(row for row in read_shared_payload(root)["entries"][0]["audiences"] if row["kind"] == "owner_private")
@@ -158,6 +159,72 @@ def test_a_prompt_is_the_owner_s_under_the_client_s_entry_and_a_hermes_entry_rec
         "QX-17" in item["content"] and item["entries"] == [{"id": "claude-code", "name": "Claude Code"}]
         for item in items
     )
+
+
+def test_a_shared_client_capture_before_runtime_attach_queues_only_an_embedding(store):
+    root, _homes, client, _capture = store
+    hook = _hook(client)
+    try:
+        hook.handle_payload(_prompt("TEST 青鸟计划的新代号是 QX-18。", prompt_id="TEST-prompt-no-port"))
+    finally:
+        hook.close()
+    assert _rows(root, "SELECT work_type FROM work_items ORDER BY work_type") == [("embed",)]
+
+
+def test_a_shared_client_capture_queues_consolidation_when_the_entry_runtime_has_a_route(store):
+    root, _homes, client, _capture = store
+    config = load_shared_client(client, "claude-code")
+    runtime_config_path = config.runtime_config_path
+    runtime_config_path.parent.mkdir(parents=True, exist_ok=True)
+    runtime_config_path.write_text(
+        json.dumps(
+            {
+                "binding": {
+                    "agent_id": config.agent_id,
+                    "installation_id": config.installation_id,
+                    "data_directory": str(config.data_directory),
+                    "scope_ids": sorted(config.scope_ids),
+                    "test_mode": config.test_mode,
+                    "installation_kind": "shared",
+                },
+                "session_id": "TEST-session",
+                "allowed_scope_ids": sorted(config.scope_ids),
+                "auxiliary": {
+                    "external_embedding": False,
+                    "external_consolidation": True,
+                    "ledger_path": str(root / "auxiliary-budget.sqlite3"),
+                    "consolidation": {
+                        "kind": "openai",
+                        "model": "TEST-consolidation-model",
+                        "endpoint": "https://example.invalid/v1/chat/completions",
+                        "credential_env": "TEST_CONSOLIDATION_KEY",
+                        "output_limit_field": "max_tokens",
+                        "max_output_tokens": 256,
+                    },
+                    "budget": {
+                        "approved_models": ["TEST-consolidation-model"],
+                        "pricing": {
+                            "TEST-consolidation-model": {
+                                "input_usd_per_million": 0,
+                                "output_usd_per_million": 0,
+                            }
+                        },
+                    },
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    hook = _hook(client)
+    assert hook.core.config.admission_policy.consolidation_enabled is True
+    try:
+        hook.handle_payload(_prompt("TEST 青鸟计划的新代号是 QX-19。", prompt_id="TEST-prompt-with-port"))
+        assert hook._host_runtime is not None and hook._host_runtime.configured
+        assert hook.core.consolidation is not None
+    finally:
+        hook.close()
+    assert _rows(root, "SELECT work_type FROM work_items ORDER BY work_type") == [("consolidate",), ("embed",)]
 
 
 def test_what_a_hermes_entry_was_told_reaches_the_client_s_prompt_marked_as_theirs(store):
@@ -3115,6 +3182,7 @@ def _embedding_entry(base, monkeypatch, *, delay=0.0):
         entry_id="tianshu",
         display_name="TEST",
         now="2026-09-24T20:00:00Z",
+        store_owner=True,
     )
     payload = read_shared_payload(root)
     routes = {

@@ -37,6 +37,7 @@ LANCE_WORKER_METHODS = frozenset(
         "delete_by_ids",
         "contains_id",
         "list_ids",
+        "list_id_targets",
         "list_records",
         "search",
         "search_scopes",
@@ -828,6 +829,9 @@ class ProcessLanceVectorStore(VectorStore):
 
     def list_ids(self) -> list[str]:
         return self._call("list_ids")
+
+    def list_id_targets(self) -> list[dict[str, str]]:
+        return self._call("list_id_targets")
 
     def list_records(self) -> dict[str, dict[str, Any]]:
         return self._call("list_records")

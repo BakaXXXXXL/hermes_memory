@@ -56,6 +56,7 @@ ALLOWED_TRUTH_WRITER_ROLES = frozenset(
         "auto_adjudication_progress",
         "truth_connection",
         "journal_source_restore",
+        "vector_cleanup",
     }
 )
 _UNKNOWN_TRUTH_WRITER_ROLE = "unknown"

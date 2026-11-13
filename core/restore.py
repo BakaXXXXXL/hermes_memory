@@ -155,6 +155,139 @@ def _restore_checkpoint(storage, context, ledger):
     return marker, checkpoint_epoch
 
 
+def _obsolete_retired_work(
+    conn,
+    ref: str,
+    scopes,
+    partition,
+    *,
+    revision: int | None = None,
+    before: int | None = None,
+    through: int | None = None,
+) -> None:
+    marks = ",".join("?" for _ in scopes)
+    scope_where = f"scope_id IN ({marks}) AND project_id IS ? AND branch_id IS ?"
+    tail = (*scopes, *partition)
+    if revision is not None:
+        conn.execute(
+            f"""UPDATE work_items SET state='obsolete',lease_token=lease_token+1,
+            lease_owner=NULL,lease_until=NULL
+            WHERE subject_ref=? AND subject_revision=? AND state IN ('pending','leased')
+            AND {scope_where}""",
+            (ref, revision, *tail),
+        )
+    elif before is not None:
+        conn.execute(
+            f"""UPDATE work_items SET state='obsolete',lease_token=lease_token+1,
+            lease_owner=NULL,lease_until=NULL
+            WHERE subject_ref=? AND subject_revision<? AND state IN ('pending','leased')
+            AND {scope_where}""",
+            (ref, before, *tail),
+        )
+    elif through is not None:
+        conn.execute(
+            f"""UPDATE work_items SET state='obsolete',lease_token=lease_token+1,
+            lease_owner=NULL,lease_until=NULL
+            WHERE subject_ref=? AND subject_revision<=? AND state IN ('pending','leased')
+            AND {scope_where}""",
+            (ref, through, *tail),
+        )
+    else:
+        conn.execute(
+            f"""UPDATE work_items SET state='obsolete',lease_token=lease_token+1,
+            lease_owner=NULL,lease_until=NULL
+            WHERE subject_ref=? AND state IN ('pending','leased') AND {scope_where}""",
+            (ref, *tail),
+        )
+
+
+def _replay_retired_revisions(conn, scopes, partition, mapping) -> int:
+    marks = ",".join("?" for _ in scopes)
+    count = 0
+    for ref, revisions in mapping.items():
+        if type(ref) is not str or not isinstance(revisions, list):
+            raise ContractError("RESTORE_UNVERIFIED", "generation_retirement")
+        for revision in revisions:
+            if type(revision) is not int or revision < 1:
+                raise ContractError("RESTORE_UNVERIFIED", "generation_retirement")
+            count += conn.execute(
+                f"""UPDATE source_events SET suppressed=1 WHERE event_id=? AND source_revision=?
+                AND scope_id IN ({marks}) AND project_id IS ? AND branch_id IS ? AND suppressed=0""",
+                (ref, revision, *scopes, *partition),
+            ).rowcount
+            _obsolete_retired_work(conn, ref, scopes, partition, revision=revision)
+    return count
+
+
+def _replay_retired_below(conn, scopes, partition, mapping) -> int:
+    marks = ",".join("?" for _ in scopes)
+    count = 0
+    for ref, before in mapping.items():
+        if type(ref) is not str or type(before) is not int or before < 1:
+            raise ContractError("RESTORE_UNVERIFIED", "generation_retirement")
+        count += conn.execute(
+            f"""UPDATE source_events SET suppressed=1 WHERE event_id=? AND source_revision<?
+            AND scope_id IN ({marks}) AND project_id IS ? AND branch_id IS ? AND suppressed=0""",
+            (ref, before, *scopes, *partition),
+        ).rowcount
+        _obsolete_retired_work(conn, ref, scopes, partition, before=before)
+    return count
+
+
+def _replay_retired_all(conn, scopes, partition, refs, ceilings) -> int:
+    if not isinstance(refs, list) or any(type(ref) is not str for ref in refs):
+        raise ContractError("RESTORE_UNVERIFIED", "generation_retirement")
+    if not isinstance(ceilings, dict) or set(ceilings) != set(refs):
+        raise ContractError("RESTORE_UNVERIFIED", "generation_retirement")
+    marks = ",".join("?" for _ in scopes)
+    count = 0
+    for ref in dict.fromkeys(refs):
+        ceiling = ceilings[ref]
+        if type(ceiling) is not int or ceiling < 1:
+            raise ContractError("RESTORE_UNVERIFIED", "generation_retirement")
+        count += conn.execute(
+            f"""UPDATE source_events SET suppressed=1 WHERE event_id=? AND source_revision<=?
+            AND scope_id IN ({marks}) AND project_id IS ? AND branch_id IS ? AND suppressed=0""",
+            (ref, ceiling, *scopes, *partition),
+        ).rowcount
+        _obsolete_retired_work(conn, ref, scopes, partition, through=ceiling)
+    return count
+
+
+def _replay_generation_retirements(conn, context, row, descriptor) -> int:
+    """Replay a generation retirement against the restored snapshot.
+
+    A generation retirement is not an object block: it suppresses only the
+    named revisions, every revision below a fence, or every revision up to the
+    ceiling recorded when all generations were retired, so a newer generation
+    restored beside it stays readable.
+    """
+    if not isinstance(descriptor, dict):
+        raise ContractError("RESTORE_UNVERIFIED", "generation_retirement")
+    kind = descriptor.get("kind")
+    if kind not in {"revisions", "below", "all"}:
+        raise ContractError("RESTORE_UNVERIFIED", "generation_retirement")
+    scopes = json.loads(row["scope_ids_json"])
+    if not scopes or not set(scopes) <= context.allowed_scope_ids:
+        raise ContractError("RESTORE_UNVERIFIED", "generation_retirement_scope")
+    partition = (row["project_id"], row["branch_id"])
+    if kind == "revisions":
+        mapping = descriptor.get("revisions")
+        if not isinstance(mapping, dict):
+            raise ContractError("RESTORE_UNVERIFIED", "generation_retirement")
+        return _replay_retired_revisions(conn, scopes, partition, mapping)
+    if kind == "below":
+        mapping = descriptor.get("below")
+        if not isinstance(mapping, dict):
+            raise ContractError("RESTORE_UNVERIFIED", "generation_retirement")
+        return _replay_retired_below(conn, scopes, partition, mapping)
+    refs = descriptor.get("refs")
+    ceilings = descriptor.get("ceilings")
+    if not isinstance(refs, list) or not isinstance(ceilings, dict):
+        raise ContractError("RESTORE_UNVERIFIED", "generation_retirement")
+    return _replay_retired_all(conn, scopes, partition, refs, ceilings)
+
+
 def _replay_operation(tx, conn, context, entry, checkpoint_epoch) -> int:
     """Replay one deletion operation of the ledger: the operation, its members' tombstones and, for a delete, the
     purge.  Returns how many objects it names."""
@@ -204,6 +337,17 @@ def _replay_operation(tx, conn, context, entry, checkpoint_epoch) -> int:
             "UPDATE deletion_operations SET active_content_removed=0,layers_json=? WHERE operation_id=?",
             (row["layers_json"], row["operation_id"]),
         )
+    retirement = layers.get("generation_retirements")
+    if retirement is not None:
+        if row["mode"] != "suppress":
+            raise ContractError("RESTORE_UNVERIFIED", "generation_retirement_mode")
+        # A retirement that suppressed no live generation at write time has
+        # nothing to replay.  Applying its descriptor to an older snapshot
+        # could hide a generation that was live when the checkpoint was taken.
+        retired = layers.get("retired")
+        if type(retired) is int and retired == 0:
+            return 0
+        return _replay_generation_retirements(conn, context, row, retirement)
     targets = []
     for member in entry["members"]:
         if member["scope_id"] not in context.allowed_scope_ids or member["object_kind"] not in OBJECT_TABLES:

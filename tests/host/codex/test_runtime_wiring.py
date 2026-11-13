@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -25,7 +26,7 @@ def test_runtime_wiring_uses_this_source_checkout(record_property):
     assert actual == expected
 
 
-def _runtime_payload(binding, *, session_id: str, allowed_scope_ids) -> dict:
+def _runtime_payload(binding, *, session_id: str, allowed_scope_ids, auxiliary: dict | None = None) -> dict:
     return {
         "binding": {
             "agent_id": binding.agent_id,
@@ -42,13 +43,41 @@ def _runtime_payload(binding, *, session_id: str, allowed_scope_ids) -> dict:
         "drain_seconds": 120.0,
         "max_items": 32,
         "lease_seconds": 60.0,
-        "auxiliary": {"external_embedding": False, "external_consolidation": False},
+        "auxiliary": auxiliary or {"external_embedding": False, "external_consolidation": False},
     }
 
 
 def _write_runtime_config(path: Path, payload: dict) -> Path:
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     return path
+
+
+def _consolidation_auxiliary(ledger_path: Path | None, *, route: bool = True) -> dict:
+    auxiliary = {
+        "external_embedding": False,
+        "external_consolidation": True,
+        "budget": {
+            "approved_models": ["TEST-consolidation-model"],
+            "pricing": {"TEST-consolidation-model": {"input_usd_per_million": 0, "output_usd_per_million": 0}},
+        },
+    }
+    if ledger_path is not None:
+        auxiliary["ledger_path"] = str(ledger_path)
+    if route:
+        auxiliary["consolidation"] = {
+            "kind": "openai",
+            "model": "TEST-consolidation-model",
+            "endpoint": "https://example.invalid/v1/chat/completions",
+            "credential_env": "TEST_CONSOLIDATION_KEY",
+            "output_limit_field": "max_tokens",
+            "max_output_tokens": 256,
+        }
+    return auxiliary
+
+
+def _work_types(config) -> list[tuple[str]]:
+    with sqlite3.connect(config.data_directory / "memory.sqlite3") as conn:
+        return conn.execute("SELECT work_type FROM work_items ORDER BY work_type").fetchall()
 
 
 @pytest.fixture
@@ -94,6 +123,240 @@ def test_missing_optional_runtime_path_falls_back_to_basic(codex_install):
     assert handler.core is core
     assert GAP_UNCONFIGURED in handler.diagnostics.capability_gaps
     handler.close()
+
+
+def test_hook_capture_before_runtime_attach_queues_only_an_embedding(codex_install):
+    """Without a trusted route the basic Core has no consolidation port, so the source must not leave
+    consolidation work behind for a port that never arrives."""
+    config, _core, project, _runtime_path = codex_install
+    handler = CodexHookHandler.from_config_path(str(config.config_path))
+    try:
+        handler.handle_payload(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "TEST-session",
+                "turn_id": "turn-1",
+                "cwd": str(project),
+                "prompt": "TEST hook capture before any runtime port.",
+            }
+        )
+    finally:
+        handler.close()
+    with sqlite3.connect(config.data_directory / "memory.sqlite3") as conn:
+        assert conn.execute("SELECT work_type FROM work_items ORDER BY work_type").fetchall() == [("embed",)]
+
+
+def _route_install(codex_install, auxiliary: dict):
+    config, _core, project, runtime_path = codex_install
+    _write_runtime_config(
+        runtime_path,
+        _runtime_payload(
+            config.to_binding(),
+            session_id="TEST-session",
+            allowed_scope_ids=config.scope_ids,
+            auxiliary=auxiliary,
+        ),
+    )
+    handler = CodexHookHandler.from_config_path(str(config.config_path), trusted_runtime_config_path=str(runtime_path))
+    return config, project, handler
+
+
+def test_a_hook_capture_queues_consolidation_when_the_trusted_route_supplies_a_port(codex_install):
+    """The basic Core that captures has no port yet; the trusted route is what the later runtime will build."""
+    auxiliary = _consolidation_auxiliary(codex_install[0].data_directory.parent / "auxiliary-budget.sqlite3")
+    config, project, handler = _route_install(codex_install, auxiliary)
+    assert handler.core.config.admission_policy.consolidation_enabled is True
+    try:
+        handler.handle_payload(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "TEST-session",
+                "turn_id": "turn-1",
+                "cwd": str(project),
+                "prompt": "TEST hook capture with a configured consolidation route.",
+            }
+        )
+        assert handler._host_runtime is not None and handler._host_runtime.configured
+        assert handler.core.consolidation is not None
+    finally:
+        handler.close()
+    assert _work_types(config) == [("consolidate",), ("embed",)]
+
+
+def test_a_stop_capture_queues_consolidation_before_the_runtime_attaches(codex_install):
+    auxiliary = _consolidation_auxiliary(codex_install[0].data_directory.parent / "auxiliary-budget.sqlite3")
+    config, project, handler = _route_install(codex_install, auxiliary)
+    try:
+        handler.handle_payload(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "TEST-session",
+                "turn_id": "turn-1",
+                "cwd": str(project),
+                "last_assistant_message": "TEST assistant reply that should be consolidated.",
+            }
+        )
+        assert handler._host_runtime is not None and handler._host_runtime.configured
+        assert handler.core.consolidation is not None
+    finally:
+        handler.close()
+    assert _work_types(config) == [("consolidate",), ("embed",)]
+
+
+def test_a_malformed_runtime_config_does_not_break_the_hook(codex_install):
+    config, _core, project, runtime_path = codex_install
+    runtime_path.write_text(
+        json.dumps(
+            {
+                "binding": {
+                    "agent_id": config.agent_id,
+                    "installation_id": config.installation_id,
+                    "data_directory": str(config.data_directory),
+                    "scope_ids": 5,
+                    "test_mode": config.test_mode,
+                },
+                "session_id": "TEST-session",
+                "allowed_scope_ids": sorted(config.scope_ids),
+            }
+        ),
+        encoding="utf-8",
+    )
+    handler = CodexHookHandler.from_config_path(str(config.config_path), trusted_runtime_config_path=str(runtime_path))
+    assert handler.core.config.admission_policy.consolidation_enabled is False
+    try:
+        handler.handle_payload(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "TEST-session",
+                "turn_id": "turn-1",
+                "cwd": str(project),
+                "prompt": "TEST hook capture with a malformed runtime config.",
+            }
+        )
+        assert handler._host_runtime is None
+    finally:
+        handler.close()
+    assert _work_types(config) == [("embed",)]
+
+
+def test_a_route_written_after_capture_does_not_backfill_consolidation(codex_install):
+    config, _core, project, runtime_path = codex_install
+    handler = CodexHookHandler.from_config_path(str(config.config_path), trusted_runtime_config_path=str(runtime_path))
+    with patch.object(handler, "ensure_runtime"):
+        handler.handle_payload(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "TEST-session",
+                "turn_id": "turn-1",
+                "cwd": str(project),
+                "prompt": "TEST hook capture before the route is written.",
+            }
+        )
+    assert _work_types(config) == [("embed",)]
+    _write_runtime_config(
+        runtime_path,
+        _runtime_payload(
+            config.to_binding(),
+            session_id="TEST-session",
+            allowed_scope_ids=config.scope_ids,
+            auxiliary=_consolidation_auxiliary(config.data_directory.parent / "auxiliary-budget.sqlite3"),
+        ),
+    )
+    try:
+        handler.ensure_runtime()
+        assert handler._host_runtime is not None and handler._host_runtime.configured
+        assert handler.core.consolidation is not None
+    finally:
+        handler.close()
+    assert _work_types(config) == [("embed",)]
+
+
+def test_a_hook_capture_reads_the_binding_directory_runtime_route(codex_install):
+    config, _core, project, _runtime_path = codex_install
+    default_path = config.data_directory / "runtime-config.json"
+    _write_runtime_config(
+        default_path,
+        _runtime_payload(
+            config.to_binding(),
+            session_id="TEST-session",
+            allowed_scope_ids=config.scope_ids,
+            auxiliary=_consolidation_auxiliary(config.data_directory.parent / "auxiliary-budget.sqlite3"),
+        ),
+    )
+    handler = CodexHookHandler.from_config_path(str(config.config_path))
+    assert handler.core.config.admission_policy.consolidation_enabled is True
+    try:
+        handler.handle_payload(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "TEST-session",
+                "turn_id": "turn-1",
+                "cwd": str(project),
+                "prompt": "TEST hook capture with the default runtime route.",
+            }
+        )
+        assert handler._host_runtime is not None and handler._host_runtime.configured
+        assert handler.core.consolidation is not None
+    finally:
+        handler.close()
+    assert _work_types(config) == [("consolidate",), ("embed",)]
+
+
+def test_a_hook_capture_ignores_a_route_whose_binding_does_not_match(codex_install):
+    config, _core, project, runtime_path = codex_install
+    payload = _runtime_payload(
+        config.to_binding(),
+        session_id="TEST-session",
+        allowed_scope_ids=config.scope_ids,
+        auxiliary=_consolidation_auxiliary(config.data_directory.parent / "auxiliary-budget.sqlite3"),
+    )
+    payload["binding"]["agent_id"] = "OTHER-agent"
+    _write_runtime_config(runtime_path, payload)
+    handler = CodexHookHandler.from_config_path(str(config.config_path), trusted_runtime_config_path=str(runtime_path))
+    assert handler.core.config.admission_policy.consolidation_enabled is False
+    try:
+        handler.handle_payload(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "TEST-session",
+                "turn_id": "turn-1",
+                "cwd": str(project),
+                "prompt": "TEST hook capture with a foreign runtime route.",
+            }
+        )
+        assert handler._host_runtime is not None and not handler._host_runtime.configured
+    finally:
+        handler.close()
+    assert _work_types(config) == [("embed",)]
+
+
+@pytest.mark.parametrize(
+    "auxiliary",
+    [
+        {"external_embedding": False, "external_consolidation": False},
+        _consolidation_auxiliary(None, route=False),
+        _consolidation_auxiliary(None, route=True),
+    ],
+    ids=("disabled", "approved-without-route", "route-without-ledger"),
+)
+def test_a_hook_capture_without_a_ledger_backed_route_queues_only_an_embedding(codex_install, auxiliary):
+    config, project, handler = _route_install(codex_install, auxiliary)
+    assert handler.core.config.admission_policy.consolidation_enabled is False
+    try:
+        handler.handle_payload(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "TEST-session",
+                "turn_id": "turn-1",
+                "cwd": str(project),
+                "prompt": "TEST hook capture without a consolidation route.",
+            }
+        )
+        assert handler._host_runtime is not None and handler._host_runtime.configured
+        assert handler.core.consolidation is None
+    finally:
+        handler.close()
+    assert _work_types(config) == [("embed",)]
 
 
 def test_handler_and_mcp_share_runtime_core(codex_install):

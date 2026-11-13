@@ -116,6 +116,40 @@ def test_missing_identity_fails_closed(initialize_kwargs, hermes_home):
         bind_hermes_identity("TEST-session-1", **kwargs)
 
 
+def test_a_session_that_names_no_platform_is_not_the_cli_owner(initialize_kwargs, hermes_home):
+    install_hermes_scope_recall(
+        hermes_home,
+        agent_id=initialize_kwargs["agent_identity"],
+        platform=initialize_kwargs["platform"],
+        user_id=initialize_kwargs["user_id"],
+        agent_workspace=initialize_kwargs["agent_workspace"],
+        test_mode=False,
+    )
+    kwargs = dict(initialize_kwargs)
+    kwargs.pop("platform")
+    with pytest.raises(HermesIdentityError, match="platform is required"):
+        bind_hermes_identity("TEST-session-1", **kwargs)
+
+    explicit = bind_hermes_identity("TEST-session-2", **initialize_kwargs)
+    assert explicit.scope.platform == "cli"
+    assert explicit.owner_private_scope_id in explicit.runtime_audience.allowed_scope_ids
+
+
+def test_a_local_installation_still_refuses_a_profile_name_that_differs_from_its_agent_id(
+    initialize_kwargs, hermes_home
+):
+    install_hermes_scope_recall(
+        hermes_home,
+        agent_id=initialize_kwargs["agent_identity"],
+        platform=initialize_kwargs["platform"],
+        user_id=initialize_kwargs["user_id"],
+        agent_workspace=initialize_kwargs["agent_workspace"],
+        test_mode=False,
+    )
+    with pytest.raises(HermesIdentityError, match="agent_identity conflict"):
+        bind_hermes_identity("TEST-session-1", **dict(initialize_kwargs, agent_identity="TEST-other-profile"))
+
+
 def test_an_alternate_user_id_is_the_same_sender_not_a_conflict(initialize_kwargs, hermes_home):
     """#116: Feishu sends open_id as user_id and union_id as user_id_alt on every session.
     Refusing the pair failed every Feishu session closed; the principal stays user_id."""

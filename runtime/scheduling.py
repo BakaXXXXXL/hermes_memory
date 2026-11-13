@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +21,15 @@ from ..core.inbox_rules import REPLAY_CANDIDATES, RETRIED, deferred_until, repla
 from ..core.storage import SQLiteStorage
 from ..core.work_storage import AUTO_RECOVERABLE_WORK_TYPES
 from .model_budget import provider_holds
+from .vector_retention import (
+    RESERVE_SECONDS,
+    installation_backoff_key,
+    next_pass_at,
+    read_backoff,
+    read_state,
+    retention_partitions,
+    shared_entry_ids,
+)
 from .worker_entry import (
     DAILY_COUNTER_MAX,
     load_config,
@@ -98,6 +108,110 @@ def _daily_items_used(config, now: datetime) -> int:
     return used
 
 
+def _shared_worker(config, context) -> bool:
+    """Whether this config drains a shared store for every entry at once."""
+    return (
+        getattr(context, "entry_id", None) is None
+        and getattr(getattr(config, "binding", None), "installation_kind", "local") == "shared"
+    )
+
+
+def _retention_retry_at(config, *, now: datetime) -> datetime:
+    """When a failed retention read may be tried again: its installation backoff, or now."""
+    vector = getattr(config, "vector", None)
+    binding = getattr(config, "binding", None)
+    data_directory = Path(getattr(binding, "data_directory", None) or getattr(vector, "storage_dir", "."))
+    key = installation_backoff_key(getattr(binding, "installation_id", ""))
+    backoff = read_backoff(data_directory, key)
+    return max(now, backoff) if backoff is not None else now
+
+
+def _retention_due(
+    config, *, now: datetime, entry_ids: Iterable[str] | None = None, context=None
+) -> tuple[datetime | None, bool]:
+    """When retention next needs a worker, and whether a registry or partition read failed.
+
+    A failed read has no partition record to hold, so it returns the
+    installation's retry time instead of ``None``.  ``_retention_due_at`` keeps
+    the single-value form its callers use.
+    """
+    vector = getattr(config, "vector", None)
+    if vector is None:
+        return None, False
+    days = getattr(vector, "tool_output_retention_days", 0)
+    if not days or getattr(config, "drain_seconds", 0) <= RESERVE_SECONDS:
+        return None, False
+    if context is None:
+        context = getattr(config, "context", None)
+        if callable(context):
+            context = context()
+    binding = getattr(config, "binding", None)
+    data_directory = Path(getattr(binding, "data_directory", None) or vector.storage_dir)
+    installation_key = installation_backoff_key(getattr(binding, "installation_id", ""))
+    if entry_ids is None and _shared_worker(config, context):
+        try:
+            entry_ids = shared_entry_ids(SQLiteStorage(config.binding), context)
+        except Exception:  # noqa: BLE001 - the retry is visible; the planner must not go idle.
+            return _retention_retry_at(config, now=now), True
+    try:
+        partitions = retention_partitions(config, context, days=days, entry_ids=entry_ids)
+    except Exception:  # noqa: BLE001 - a read failure leaves no partition; retry installation-wide.
+        return _retention_retry_at(config, now=now), True
+    due_times = []
+    for partition in partitions:
+        due = next_pass_at(read_state(Path(vector.storage_dir), partition.key), days, now=now)
+        if due is None:
+            continue
+        backoff = read_backoff(data_directory, partition.key)
+        due_times.append(max(due, backoff) if backoff is not None else due)
+    due = min(due_times) if due_times else None
+    installation_backoff = read_backoff(data_directory, installation_key)
+    if installation_backoff is not None:
+        due = installation_backoff if due is None else max(due, installation_backoff)
+    return due, False
+
+
+def _retention_due_at(
+    config, *, now: datetime, entry_ids: Iterable[str] | None = None, context=None
+) -> datetime | None:
+    """When tool-output retention next needs a worker, or ``None`` when it is off.
+
+    Retention runs inside a drain and is invisible to the work queue.  Without
+    this the planner reports idle while an expired window waits, so no wake
+    starts the pass; and reporting it as due on every read would start one on
+    every five-minute timer tick.  A shared worker's context names no entry, so
+    the planner reads the store's registered entries and takes the earliest due
+    partition; the pass writes those same keys with the same window.  A deferred
+    partition's backoff holds its wake past the timer tick, and a registry or
+    partition read failure returns the installation-level retry time.
+    """
+    return _retention_due(config, now=now, entry_ids=entry_ids, context=context)[0]
+
+
+def _retention_wakes(
+    config, *, now: datetime, entry_ids: Iterable[str] | None = None, tx=None
+) -> list[tuple[datetime, str]]:
+    """The retention candidate for a planner's starting list; empty when the pass is not due."""
+    context = getattr(config, "context", None)
+    if callable(context):
+        context = context()
+    if entry_ids is None and _shared_worker(config, context):
+        if tx is not None:
+            try:
+                entry_ids = tuple(sorted(tx.registry.entries()))
+            except Exception:  # noqa: BLE001 - the retry is visible; the planner must not go idle.
+                return [(_retention_retry_at(config, now=now), "vector_retention_retry")]
+        else:
+            try:
+                entry_ids = shared_entry_ids(SQLiteStorage(config.binding), context)
+            except Exception:  # noqa: BLE001 - the retry is visible; the planner must not go idle.
+                return [(_retention_retry_at(config, now=now), "vector_retention_retry")]
+    due, retry = _retention_due(config, now=now, entry_ids=entry_ids, context=context)
+    if due is None:
+        return []
+    return [(due, "vector_retention_retry" if retry else "vector_retention")]
+
+
 def _auto_recovery_rows(conn, base: str, params: tuple, config) -> list:
     """Failed items still inside their automatic recovery allowance."""
     errors = sorted(AUTO_RECOVERABLE_ERRORS)
@@ -167,11 +281,11 @@ def next_wake(config, *, now: datetime | None = None, unavailable_until=None) ->
     marks = ",".join("?" for _ in scopes)
     base = f"scope_id IN ({marks}) AND (project_id IS NULL OR project_id=?) AND (branch_id IS NULL OR branch_id=?)"
     params = (*scopes, config.project_id, config.branch_id)
-    candidates = []
     pending = blocked = failed = 0
     storage = SQLiteStorage(config.binding)
     with storage.read(config.context(), remaining_seconds=1.0) as tx:
         conn = tx._check()
+        candidates = list(_retention_wakes(config, now=now, tx=tx))
         source_pages = tx.candidates.pending_source_pages()
         if source_pages:
             pending += source_pages

@@ -75,6 +75,18 @@ class VectorStore(ABC):
     @abstractmethod
     def list_ids(self) -> list[str]: ...
 
+    def list_id_targets(self) -> list[dict[str, str]]:
+        """Every row's id and writer metadata, without loading its vector where the store can avoid it.
+
+        A store that cannot project the two columns falls back to ``list_records``; the
+        Lance and SQLite companions override this with a narrow read.
+        """
+        return [
+            {"id": str(row.get("id") or ""), "target": str(row.get("target") or "")}
+            for row in self.list_records().values()
+            if row.get("id")
+        ]
+
     @abstractmethod
     def list_records(self) -> dict[str, dict[str, Any]]: ...
 

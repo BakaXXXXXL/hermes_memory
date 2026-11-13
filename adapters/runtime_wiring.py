@@ -21,6 +21,7 @@ from typing import Any, Mapping
 
 from scope_recall.contracts import InstanceBinding
 from scope_recall.core import CoreConfig, MemoryCore
+from scope_recall.core.admission import BASIC_CORE_ADMISSION
 from scope_recall.core.recall_budget import canonical_render_json
 from scope_recall.runtime.instance import RuntimeInstance, build_runtime_instance
 from scope_recall.runtime.instance_config import RuntimeInstanceConfig
@@ -163,7 +164,7 @@ def _basic_core(expected_binding: InstanceBinding, core: MemoryCore | None, cloc
         return core
     # Optional host wiring must not create or repair a database.  The normal
     # installer owns initialization; a later status/recall reports absence.
-    return MemoryCore(CoreConfig(expected_binding), clock=clock)
+    return MemoryCore(CoreConfig(expected_binding, admission_policy=BASIC_CORE_ADMISSION), clock=clock)
 
 
 def strict_hook_budget(value: object) -> float:

@@ -390,6 +390,11 @@ class SQLiteBruteForceVectorStore(VectorStore):
             rows = self._require_conn().execute("SELECT id FROM vector_records ORDER BY id").fetchall()
         return [str(row["id"]) for row in rows]
 
+    def list_id_targets(self) -> list[dict[str, str]]:
+        with self._lock:
+            rows = self._require_conn().execute("SELECT id,target FROM vector_records ORDER BY id").fetchall()
+        return [{"id": str(row["id"]), "target": str(row["target"] or "")} for row in rows if row["id"]]
+
     def list_records(self) -> dict[str, dict[str, Any]]:
         return {str(record["id"]): record for record in map(self._row_to_record, self._rows())}
 

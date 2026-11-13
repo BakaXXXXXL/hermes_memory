@@ -42,10 +42,11 @@ import os
 import re
 import sqlite3
 import time
-from datetime import datetime, timezone
+from dataclasses import fields
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, cast
 from urllib.request import pathname2url
 
 from ..adapters.hermes.shared_entries import read_shared_payload
@@ -55,8 +56,10 @@ from ..core.events import indexed_terms, withheld_tool_output
 from ..core.schema import SCHEMA_VERSION
 from ..core.truth_connection import connect_truth_database
 from ..core.writer_lease import TruthWriterBusyError
+from ..runtime.instance_config import VectorRuntimeConfig
 from ..runtime.running_code import live_records
-from ..runtime.vector_retention import OMITTED_TOOL_OUTPUT, REPEATED_TOOL_OUTPUT
+from ..runtime.vector_retention import OMITTED_TOOL_OUTPUT, retained_repeated_tool_output
+from ..runtime.worker_launch import RUNTIME_CONFIG_FILENAME
 from .shared_run import Run, SharedStoreError
 
 #: Store versions whose tables this import reads.  An older store is upgraded first.
@@ -64,6 +67,11 @@ SOURCE_SCHEMAS = frozenset({1109, 1110})
 #: Anything shaped like a source id; renamed only when the old store holds exactly that id.
 _EVENT_TOKEN = re.compile(r"(?<![0-9A-Za-z_-])event-[0-9A-Za-z_-]+")
 _CHUNK = 2000
+#: The window a shared worker gets when the store has no runtime config yet.
+_DEFAULT_RETENTION_DAYS = cast(
+    int,
+    next(field.default for field in fields(VectorRuntimeConfig) if field.name == "tool_output_retention_days"),
+)
 
 
 class SourceRefused(Exception):
@@ -178,7 +186,16 @@ def _open_source(database: Path, home: str) -> sqlite3.Connection:
     return src
 
 
-def _import_rows(conn, src, names: _Names, *, store_installation: str, store_scopes: frozenset[str], now: str) -> dict:
+def _import_rows(
+    conn,
+    src,
+    names: _Names,
+    *,
+    store_installation: str,
+    store_scopes: frozenset[str],
+    now: str,
+    root: Path,
+) -> dict:
     counts: dict[str, int] = {}
     source_meta = src.execute("SELECT installation_id FROM instance_meta").fetchone()
     old_binding = SimpleNamespace(installation_id=source_meta[0])
@@ -487,30 +504,80 @@ def _import_rows(conn, src, names: _Names, *, store_installation: str, store_sco
         heads,
     )
     counts["claim_embeddings_queued"] = len(heads)
-    counts["embeddings_retention_would_expire"] = _drop_expirable_embeddings(conn, names, now=now)
+    counts["embeddings_retention_would_expire"] = _drop_expirable_embeddings(conn, src, names, now=now, root=root)
     conn.execute("UPDATE instance_meta SET memory_epoch=max(memory_epoch+1,?) WHERE singleton=1", (imported_epoch,))
     return {"counts": counts, "claims_left_out": skipped}
 
 
-def _drop_expirable_embeddings(conn, names: _Names, *, now: str) -> int:
+def _retention_days(root: Path) -> int:
+    """The shared worker's tool-output window, read from the config its next pass will use.
+
+    ``import-entry`` runs with every writer stopped, so the store's
+    ``runtime-config.json`` is the worker config.  A store without one gets the
+    vector default; a config that names no vector store turns retention off.
+    """
+    try:
+        raw = json.loads((Path(root) / RUNTIME_CONFIG_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return _DEFAULT_RETENTION_DAYS
+    vector = raw.get("vector") if isinstance(raw, dict) else None
+    if not isinstance(vector, dict):
+        return 0
+    try:
+        return VectorRuntimeConfig.from_mapping(vector).tool_output_retention_days
+    except (ValueError, TypeError):
+        return _DEFAULT_RETENTION_DAYS
+
+
+def _drop_expirable_embeddings(conn, src, names: _Names, *, now: str, root: Path) -> int:
     """Take back the imported tool outputs' embeddings that vector retention would expire at once.
 
     A summary the capture filter left for an output it withheld, and a repeat of an earlier tool
-    output in the same scope, are what the intake gate keeps as sources only.  A store from an
-    earlier release embedded them anyway, and its embed history would queue them again: thousands
-    in front of the shared worker, each embedded and then deleted by retention within the hour.
-    They are recorded as expired, under the reason retention gives, and never asked for; the text
-    and everything drawn from it stay, recalled by their words.
+    output whose own vector retention keeps, are what the intake gate keeps as sources only.  A
+    store from an earlier release embedded them anyway, and its embed history would queue them
+    again: thousands in front of the shared worker, each embedded and then deleted by retention
+    within the hour.  They are recorded as expired, under the reason retention gives, and never
+    asked for; the text and everything drawn from it stay, recalled by their words.
+
+    The repeat question is asked of the source store, where the earlier copy's embed work is still
+    ``done``, with the shared worker's own window.  Asking it of the imported rows would see their
+    work still pending and call every fresh copy a repeat; asking it without the window would let
+    an old copy's age expire the fresh copy too.
     """
+    retention_days = _retention_days(root)
+    # Every imported source is assigned the same entry, so a repeat is partitioned by
+    # scope, project and branch alone; a 1109 source store has no entry column to ask.
+    repeat = retained_repeated_tool_output(entry_partition=False)
+    cutoff = (datetime.fromisoformat(now.replace("Z", "+00:00")) - timedelta(days=retention_days)).isoformat()
+    expirable: dict[tuple[str, int], str] = {}
+    for event_id, revision in src.execute(
+        f"SELECT e.event_id,e.source_revision FROM source_events e WHERE e.role='tool' AND {OMITTED_TOOL_OUTPUT}"
+    ):
+        expirable[(names.event(event_id), revision)] = "omitted"
+    if retention_days:
+        for event_id, revision in src.execute(
+            f"""SELECT e.event_id,e.source_revision FROM source_events e
+                WHERE e.role='tool' AND {repeat}""",
+            (cutoff,),
+        ):
+            expirable.setdefault((names.event(event_id), revision), "repeat")
+    if not expirable:
+        return 0
+    conn.execute(
+        "CREATE TEMP TABLE import_expirable(event_id TEXT NOT NULL, source_revision INTEGER NOT NULL, "
+        "reason TEXT NOT NULL, PRIMARY KEY(event_id,source_revision))"
+    )
+    conn.executemany(
+        "INSERT INTO temp.import_expirable(event_id,source_revision,reason) VALUES (?,?,?)",
+        [(event_id, revision, reason) for (event_id, revision), reason in expirable.items()],
+    )
     rows = conn.execute(
-        f"""SELECT w.work_id, e.event_id, e.source_revision,
-                   CASE WHEN {OMITTED_TOOL_OUTPUT} THEN 'omitted' ELSE 'repeat' END
-            FROM work_items w JOIN source_events e ON e.event_id=w.subject_ref AND e.source_revision=w.subject_revision
-            WHERE w.work_type='embed' AND w.state='pending' AND e.role='tool'
-              AND e.source_event_key>=? AND e.source_event_key<?
-              AND (({OMITTED_TOOL_OUTPUT}) OR {REPEATED_TOOL_OUTPUT})""",
-        (names.prefix, names.prefix[:-1] + ";"),
+        """SELECT w.work_id,x.event_id,x.source_revision,x.reason
+           FROM work_items w
+           JOIN temp.import_expirable x ON x.event_id=w.subject_ref AND x.source_revision=w.subject_revision
+           WHERE w.work_type='embed' AND w.state='pending'"""
     ).fetchall()
+    conn.execute("DROP TABLE temp.import_expirable")
     conn.executemany("DELETE FROM work_items WHERE work_id=?", [(row[0],) for row in rows])
     conn.executemany(
         "INSERT OR IGNORE INTO expired_vectors(source_ref,source_revision,expired_at,reason) VALUES (?,?,?,?)",
@@ -576,6 +643,7 @@ def import_entry(
                             store_installation=payload["installation_id"],
                             store_scopes=frozenset(payload["scope_ids"]),
                             now=now,
+                            root=root,
                         )
                     )
                 except sqlite3.IntegrityError as exc:

@@ -59,15 +59,16 @@ def _cited_pairs(resume) -> tuple[tuple[str, int], ...]:
 
 
 def _source_states(conn, pairs) -> dict:
-    """Visibility, liveness and capture gaps of the given source versions, in one query and one row: read row by row,
-    an episode's 200 members cost a busy Hermes gateway a GIL handoff each inside a capture's write
+    """Visibility, suppression, liveness and capture gaps of the given source versions, in one query and one row: read
+    row by row, an episode's 200 members cost a busy Hermes gateway a GIL handoff each inside a capture's write
     (``lexical_index.index_terms``)."""
     if not pairs:
         return {}
     marks = ",".join("(?,?)" for _ in pairs)
     row = conn.execute(
         f"""SELECT json_group_array(json_object('event_id',s.event_id,'source_revision',s.source_revision,
-               'read_blocked',s.read_blocked,'scope_id',s.scope_id,'project_id',s.project_id,'branch_id',s.branch_id,
+               'read_blocked',s.read_blocked,'suppressed',s.suppressed,
+               'scope_id',s.scope_id,'project_id',s.project_id,'branch_id',s.branch_id,
                'capture_gaps_json',s.capture_gaps_json,
                'superseded',EXISTS(SELECT 1 FROM source_events n WHERE n.source_group_key=s.source_group_key
                       AND n.source_revision>s.source_revision)))
@@ -98,22 +99,35 @@ class Episodes:
         links = lineage.evidence(conn, "episode", ref, row["revision"])
         refs = tuple(f"{r[0]}@{r[1]}" for r in links)
         resume = json.loads(row["resume_json"]) if row["resume_json"] else None
-        # Once there is a resume its gaps are those of what it cites: the resume
-        # is derived from those sources, and an uncited member that changed
-        # does not invalidate it.  Without one every member counts.  Either way
-        # the sources are judged in one query, not loaded one by one: a
-        # 200-member episode cost 200 source loads per read, on every listing.
+        # Once there is a resume its gaps are those of what it cites: an uncited
+        # member that merely changed does not invalidate it.  Suppression is
+        # different and is judged over every member below.  Without a resume
+        # every member counts.  Either way the sources are judged in one query,
+        # not loaded one by one: a 200-member episode cost 200 source loads per
+        # read, on every listing.
         judged = _cited_pairs(resume) if resume else tuple((r[0], r[1]) for r in links)
+        members = tuple((r[0], r[1]) for r in links)
         gaps = []
-        states = _source_states(conn, judged)
+        # Suppression is judged over every member, cited or not: an automatic
+        # read must not carry a retired member's text, even when the resume
+        # itself rests on other sources.  One query covers both sets.
+        states = _source_states(conn, tuple(dict.fromkeys((*judged, *members))))
         admitted = allowed_refs(self.tx, "event", (state["event_id"] for state in states.values()))
         for key in judged:
             state = states.get(key)
             if state is None or not self._visible(state, admitted):
                 return None
-            if state["superseded"] or (state["project_id"], state["branch_id"]) != (ctx.project_id, ctx.branch_id):
+            if (
+                state["suppressed"]
+                or state["superseded"]
+                or (state["project_id"], state["branch_id"]) != (ctx.project_id, ctx.branch_id)
+            ):
                 gaps.append("source_version_changed")
             gaps.extend(json.loads(state["capture_gaps_json"]))
+        member_keys = set(members)
+        retired_member = any(state["suppressed"] for key, state in states.items() if key in member_keys)
+        if retired_member:
+            gaps.append("source_version_changed")
         pending = conn.execute(
             "SELECT count(*) FROM episode_events WHERE episode_id=? AND sequence>?",
             (ref, row["processed_sequence"]),
@@ -157,7 +171,7 @@ class Episodes:
             pending,
             bool(row["suppressed"]),
             tuple(dict.fromkeys(gaps)),
-            changed,
+            changed or retired_member,
         )
 
     def _visible(self, state, admitted: frozenset[str]) -> bool:

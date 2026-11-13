@@ -6,6 +6,7 @@ without rewriting their bytes or interpreting legacy length-prefixed tokens.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Sequence
 
 
@@ -48,6 +49,18 @@ LOCAL_USER_ID = "local"
 #: speaking in a scheduled run, a job can be created from any chat, and its
 #: prompt would be captured as the owner's own words.
 LOCAL_PLATFORMS = frozenset({"desktop", "tui"})
+
+#: The one-to-one chat types, after ``canonical_chat_type``.  Hosts name the same
+#: chat ``dm``, ``direct`` or ``private``; a route and the row written for it must
+#: agree on one spelling or an owner's DM row silently stops matching.
+PRIVATE_CHAT_TYPES = frozenset({"cli", "private"})
+_CHAT_TYPE_ALIASES = {"dm": "private", "direct": "private"}
+
+
+def canonical_chat_type(value: object) -> str:
+    """The one spelling of a one-to-one chat; any other type is kept as it is."""
+    text = str(value or "").strip().lower()
+    return _CHAT_TYPE_ALIASES.get(text, text)
 
 
 def normalize_local_platforms(values: object) -> tuple[str, ...]:
@@ -173,9 +186,10 @@ def audience_entry(
         ):
             raise HermesIdentityError(f"audiences.{key} must be an explicit exact string")
     fields = {key: value.strip() for key, value in fields.items()}
+    fields["chat_type"] = canonical_chat_type(fields["chat_type"])
     if type(kind) is not str or not kind.strip() or len(kind) > 240:
         raise HermesIdentityError("audiences.kind is required")
-    if kind == "owner_private" and fields["chat_type"] not in {"cli", "private", "direct", "dm"}:
+    if kind == "owner_private" and fields["chat_type"] not in PRIVATE_CHAT_TYPES:
         raise HermesIdentityError("owner_private audience must be an explicit private or CLI chat")
     allowed = _scope_ids(allowed_scope_ids, field="allowed_scope_ids")
     writable = _scope_ids(writable_scope_ids, field="writable_scope_ids")
@@ -202,3 +216,59 @@ def normalize_audience_entry(value: object) -> dict[str, Any]:
     if not isinstance(value["allowed_scope_ids"], list) or not isinstance(value["writable_scope_ids"], list):
         raise HermesIdentityError("audience read/write scope sets must be explicit lists")
     return audience_entry(**{key: value[key] for key in required}, kind=value.get("kind", "conversation"))
+
+
+def owner_private_scope_ids(
+    audience_scopes: Mapping[str, object], audiences: Sequence[Mapping[str, object]]
+) -> frozenset[str]:
+    """The scopes the manifest declares private to an owner.
+
+    The ``owner_private`` entry in ``audience_scopes`` is the installer's
+    declaration; an owner_private row's capture scope is the same kind of scope
+    when a migrated manifest kept several.  Scope IDs stay opaque: this reads
+    only the kind and capture fields, never the ID's bytes.
+    """
+    scopes: set[str] = set()
+    declared = audience_scopes.get("owner_private")
+    if type(declared) is str and declared:
+        scopes.add(declared)
+    for row in audiences:
+        if not isinstance(row, Mapping) or row.get("kind") != "owner_private":
+            continue
+        capture = row.get("capture_scope_id")
+        if type(capture) is str and capture:
+            scopes.add(capture)
+    return frozenset(scopes)
+
+
+def _scope_values(value: object) -> set[str]:
+    if not isinstance(value, (list, tuple)):
+        return set()
+    return {scope for scope in value if type(scope) is str}
+
+
+def assert_scope_kinds(audience_scopes: Mapping[str, object], audiences: Sequence[Mapping[str, object]]) -> None:
+    """A conversation, group or project row may never carry an owner-private scope.
+
+    A row is an exact grant to whoever matches its route.  Only an
+    owner_private row is checked against the owner principals; any other kind
+    carrying one of these scopes would hand the owner's private memory to a
+    friend who matches the chat.
+    """
+    protected = owner_private_scope_ids(audience_scopes, audiences)
+    if not protected:
+        return
+    for row in audiences:
+        if not isinstance(row, Mapping) or row.get("kind") == "owner_private":
+            continue
+        granted = _scope_values(row.get("allowed_scope_ids")) | _scope_values(row.get("writable_scope_ids"))
+        capture = row.get("capture_scope_id")
+        if type(capture) is str and capture:
+            granted.add(capture)
+        leaked = sorted(scope for scope in granted if scope in protected)
+        if leaked:
+            raise HermesIdentityError(
+                "audiences: a "
+                f"{row.get('kind') or 'conversation'} row on {row.get('platform')}/{row.get('user_id')} "
+                "may not carry an owner_private scope"
+            )

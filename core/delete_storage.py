@@ -87,14 +87,31 @@ class Deletions:
     def __init__(self, tx):
         self._tx = tx
 
-    def target(self, ref: str) -> DeleteTarget:
+    def target(self, ref: str, revision: int | None = None) -> DeleteTarget:
         conn, ctx = self._tx._check(), self._tx.context
+        if revision is not None and (type(revision) is not int or revision < 1):
+            raise ContractError("INPUT_INVALID", "source_revision")
         # No target body is returned during eligibility/ownership checks.
         if ref.startswith("event-"):
-            row = conn.execute(
-                "SELECT max(source_revision) AS revision,scope_id,project_id,branch_id FROM source_events WHERE event_id=? GROUP BY event_id",
-                (ref,),
-            ).fetchone()
+            scopes = sorted(ctx.allowed_scope_ids)
+            if not scopes:
+                raise ContractError("ACCESS_DENIED", "target_unavailable")
+            marks = ",".join("?" for _ in scopes)
+            partition = (ctx.project_id, ctx.branch_id)
+            if revision is None:
+                row = conn.execute(
+                    f"""SELECT max(source_revision) AS revision,scope_id,project_id,branch_id
+                    FROM source_events WHERE event_id=? AND scope_id IN ({marks})
+                    AND project_id IS ? AND branch_id IS ? GROUP BY event_id""",
+                    (ref, *scopes, *partition),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    f"""SELECT source_revision AS revision,scope_id,project_id,branch_id
+                    FROM source_events WHERE event_id=? AND source_revision=?
+                    AND scope_id IN ({marks}) AND project_id IS ? AND branch_id IS ?""",
+                    (ref, revision, *scopes, *partition),
+                ).fetchone()
             kind = "event"
         elif (kind := ref.split("-", 1)[0]) in OBJECT_TABLES:
             table, key = OBJECT_TABLES[kind]
@@ -167,6 +184,9 @@ class Deletions:
             sorted(request["target_refs"]),
             request["expected_revisions"],
         ]
+        retirement = request.get("retirement")
+        if retirement is not None:
+            material.append(retirement)
         digest = hashlib.sha256(canonical(material).encode()).hexdigest()
         return "forget-" + digest, digest
 
@@ -190,6 +210,9 @@ class Deletions:
             .execute("SELECT count(*) FROM deletion_members WHERE operation_id=?", (operation_id,))
             .fetchone()[0]
         )
+        affected = layers.get("affected_objects", count)
+        if type(affected) is not int or affected < 0:
+            affected = count
         return dict(
             operation_id=operation_id,
             mode=row["mode"],
@@ -198,10 +221,10 @@ class Deletions:
             project_id=row["project_id"],
             branch_id=row["branch_id"],
             requested_refs=json.loads(row["requested_refs_json"]),
-            minimum_content_unit="source_group",
+            minimum_content_unit=layers.get("minimum_content_unit", "source_group"),
             read_blocked=row["mode"] == "delete",
             suppressed=True,
-            affected_objects=count,
+            affected_objects=affected,
             active_content_removed=bool(row["active_content_removed"]),
             layers=layers,
             declared_scope_complete=False if row["mode"] == "delete" else True,
@@ -463,6 +486,268 @@ class Deletions:
                     (target.ref, target.ref),
                 )
         self._tx.candidates.block_objects(targets, operation_id=op, delete=delete, now=now)
+
+    def retire_revisions(self, targets: tuple[DeleteTarget, ...], *, now: str) -> dict:
+        """Suppress named source generations without blocking their object identity.
+
+        A note indexer replaces a chunk's text under one stable source key.  The
+        older generations stay stored for history but must not be read as
+        current.  Unlike ``block``, this writes no object or group block: the
+        object's newer generations remain visible.  Each target must belong to
+        this transaction's scope, project and branch; a caller-built target
+        from another partition is refused before it can enter the ledger.
+        """
+        descriptor = {"kind": "revisions", "revisions": {t.ref: [t.revision] for t in targets}}
+        return self._retire(targets, now=now, kind="revisions", descriptor=descriptor)
+
+    def retire_revisions_below(self, refs: dict[str, int], *, now: str) -> dict:
+        """Suppress every stored generation below ``before`` for each source ref.
+
+        This is the lifecycle a writer uses after inserting a new generation: it
+        does not depend on the writer's local state, so a crash before that state
+        was saved still retires the older generation on the next pass.
+        """
+        below: dict[str, int] = {}
+        targets = []
+        for ref, before in sorted(refs.items()):
+            if type(before) is not int or before < 1:
+                raise ContractError("INPUT_INVALID", "source_revision")
+            targets.append(self.target(ref))
+            below[ref] = before
+        if not targets:
+            raise ContractError("INPUT_INVALID", "target_refs")
+        descriptor = {"kind": "below", "below": below}
+        return self._retire(targets, now=now, kind="below", descriptor=descriptor)
+
+    def retire_generations(self, refs: tuple[str, ...], *, now: str) -> dict:
+        """Suppress every stored generation of these source objects.
+
+        A chunk that a note no longer contains is retired this way.  No object
+        block is written, so the same object can return later as a new
+        generation and become visible again.  The highest generation stored now
+        is recorded as the ceiling a restore replays.
+        """
+        targets = [self.target(ref) for ref in sorted(set(refs))]
+        if not targets:
+            raise ContractError("INPUT_INVALID", "target_refs")
+        # The highest generation seen now is the fence a restore replays: a
+        # generation written after this retirement must stay readable.
+        ceilings = {target.ref: target.revision for target in targets}
+        descriptor = {"kind": "all", "refs": [target.ref for target in targets], "ceilings": ceilings}
+        return self._retire(targets, now=now, kind="all", descriptor=descriptor)
+
+    def _retirement_revisions(self, targets: tuple[DeleteTarget, ...]) -> dict[str, int]:
+        """Validate caller-built targets before any retirement is recorded.
+
+        ``retire_revisions`` is public, so its targets are not necessarily the
+        ones ``target`` built from this transaction's context.  A target from
+        another scope or partition, or with a revision the source cannot hold,
+        would otherwise be recorded in the deletion ledger and replayed against
+        an older snapshot.
+        """
+        ctx = self._tx.context
+        revisions: dict[str, int] = {}
+        for target in targets:
+            if not isinstance(target, DeleteTarget) or target.kind != "event":
+                raise ContractError("INPUT_INVALID", "target_kind")
+            if type(target.ref) is not str or not target.ref.startswith("event-"):
+                raise ContractError("INPUT_INVALID", "target_refs")
+            if type(target.revision) is not int or target.revision < 1:
+                raise ContractError("INPUT_INVALID", "source_revision")
+            if type(target.scope_id) is not str or target.scope_id not in ctx.allowed_scope_ids:
+                raise ContractError("ACCESS_DENIED", "target_unavailable")
+            if (target.project_id, target.branch_id) != (ctx.project_id, ctx.branch_id):
+                raise ContractError("ACCESS_DENIED", "target_unavailable")
+            previous = revisions.get(target.ref)
+            if previous is not None and previous != target.revision:
+                raise ContractError("INPUT_INVALID", "source_revision")
+            revisions[target.ref] = target.revision
+        return revisions
+
+    def _check_retirement_targets(self, targets: tuple[DeleteTarget, ...]) -> None:
+        """Refuse a target the store does not hold in this transaction's partition."""
+        conn = self._tx._check()
+        for target in targets:
+            if (
+                conn.execute(
+                    """SELECT 1 FROM source_events WHERE event_id=? AND source_revision=?
+                    AND scope_id=? AND project_id IS ? AND branch_id IS ?""",
+                    (target.ref, target.revision, target.scope_id, target.project_id, target.branch_id),
+                ).fetchone()
+                is None
+            ):
+                raise ContractError("ACCESS_DENIED", "target_unavailable")
+
+    def _record_retirement(self, op, digest, request, targets, now: str, descriptor) -> None:
+        conn, ctx = self._tx._check(write=True), self._tx.context
+        layers = dict(
+            sqlite_active="retained",
+            sqlite_history="retained",
+            vector_active="retained",
+            vector_history="retained",
+            attachments="retained",
+            backups="unknown",
+            host_sources="outside_plugin_scope",
+            physical_media="unverifiable",
+            minimum_content_unit="source_revision",
+            generation_retirements=descriptor,
+        )
+        conn.execute("UPDATE instance_meta SET memory_epoch=memory_epoch+1 WHERE singleton=1")
+        epoch = self._tx.status().memory_epoch
+        conn.execute(
+            """INSERT INTO deletion_operations(operation_id,request_sha256,mode,scope_ids_json,
+            project_id,branch_id,requested_refs_json,expected_revisions_json,created_at,
+            memory_epoch,layers_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                op,
+                digest,
+                request["mode"],
+                canonical(sorted({t.scope_id for t in targets})),
+                ctx.project_id,
+                ctx.branch_id,
+                canonical(request["target_refs"]),
+                canonical(request["expected_revisions"]),
+                canonical_time(now),
+                epoch,
+                canonical(layers),
+            ),
+        )
+
+    def _apply_retirement(
+        self,
+        targets,
+        *,
+        kind: str,
+        below: dict[str, int] | None = None,
+        ceilings: dict[str, int] | None = None,
+    ) -> int:
+        conn = self._tx._check(write=True)
+        if kind == "below" and below is None:
+            raise ContractError("INPUT_INVALID", "below")
+        below = below or {}
+        if kind == "all":
+            if not isinstance(ceilings, dict) or set(ceilings) != {target.ref for target in targets}:
+                raise ContractError("INPUT_INVALID", "source_revision")
+            for ceiling in ceilings.values():
+                if type(ceiling) is not int or ceiling < 1:
+                    raise ContractError("INPUT_INVALID", "source_revision")
+        ceilings = ceilings or {}
+        retired = 0
+        for target in targets:
+            partition = (target.scope_id, target.project_id, target.branch_id)
+            if kind == "below":
+                before = below[target.ref]
+                retired += int(
+                    conn.execute(
+                        """UPDATE source_events SET suppressed=1 WHERE event_id=? AND source_revision<?
+                        AND suppressed=0 AND scope_id=? AND project_id IS ? AND branch_id IS ?""",
+                        (target.ref, before, *partition),
+                    ).rowcount
+                )
+            elif kind == "all":
+                retired += int(
+                    conn.execute(
+                        """UPDATE source_events SET suppressed=1 WHERE event_id=? AND source_revision<=?
+                        AND suppressed=0 AND scope_id=? AND project_id IS ? AND branch_id IS ?""",
+                        (target.ref, ceilings[target.ref], *partition),
+                    ).rowcount
+                )
+            else:
+                retired += int(
+                    conn.execute(
+                        """UPDATE source_events SET suppressed=1 WHERE event_id=? AND source_revision=?
+                        AND suppressed=0 AND scope_id=? AND project_id IS ? AND branch_id IS ?""",
+                        (target.ref, target.revision, *partition),
+                    ).rowcount
+                )
+            if kind == "below":
+                before = below[target.ref]
+                conn.execute(
+                    """DELETE FROM consolidation_fragments WHERE work_id IN (
+                    SELECT work_id FROM work_items WHERE subject_ref=? AND subject_revision<?
+                    AND scope_id=? AND project_id IS ? AND branch_id IS ?)""",
+                    (target.ref, before, *partition),
+                )
+                conn.execute(
+                    """UPDATE work_items SET state='obsolete',lease_token=lease_token+1,
+                    lease_owner=NULL,lease_until=NULL
+                    WHERE subject_ref=? AND subject_revision<? AND state IN ('pending','leased')
+                    AND scope_id=? AND project_id IS ? AND branch_id IS ?""",
+                    (target.ref, before, *partition),
+                )
+            elif kind == "all":
+                ceiling = ceilings[target.ref]
+                conn.execute(
+                    """DELETE FROM consolidation_fragments WHERE work_id IN (
+                    SELECT work_id FROM work_items WHERE subject_ref=? AND subject_revision<=?
+                    AND scope_id=? AND project_id IS ? AND branch_id IS ?)""",
+                    (target.ref, ceiling, *partition),
+                )
+                conn.execute(
+                    """UPDATE work_items SET state='obsolete',lease_token=lease_token+1,
+                    lease_owner=NULL,lease_until=NULL
+                    WHERE subject_ref=? AND subject_revision<=? AND state IN ('pending','leased')
+                    AND scope_id=? AND project_id IS ? AND branch_id IS ?""",
+                    (target.ref, ceiling, *partition),
+                )
+            else:
+                conn.execute(
+                    """DELETE FROM consolidation_fragments WHERE work_id IN (
+                    SELECT work_id FROM work_items WHERE subject_ref=? AND subject_revision=?
+                    AND scope_id=? AND project_id IS ? AND branch_id IS ?)""",
+                    (target.ref, target.revision, *partition),
+                )
+                conn.execute(
+                    """UPDATE work_items SET state='obsolete',lease_token=lease_token+1,
+                    lease_owner=NULL,lease_until=NULL
+                    WHERE subject_ref=? AND subject_revision=? AND state IN ('pending','leased')
+                    AND scope_id=? AND project_id IS ? AND branch_id IS ?""",
+                    (target.ref, target.revision, *partition),
+                )
+        return retired
+
+    def _retire(self, targets, *, now: str, kind: str, descriptor) -> dict:
+        targets = tuple(targets)
+        if not targets:
+            raise ContractError("INPUT_INVALID", "target_refs")
+        revisions = self._retirement_revisions(targets)
+        expected = descriptor.get("below", revisions) if kind == "below" else revisions
+        request = dict(
+            mode="suppress",
+            target_refs=sorted(revisions),
+            expected_revisions=dict(sorted(expected.items())),
+            retirement=canonical(descriptor),
+        )
+        op, digest = self.request_key(request)
+        prior = self.receipt(op)
+        if prior is not None:
+            return dict(prior, retired=0)
+        # Check existence after the idempotent repeat, so a purge that removed
+        # the rows after a successful retirement does not turn a repeat into
+        # an error.  A first request for a target the store does not hold is
+        # refused before it can enter the ledger.
+        self._check_retirement_targets(targets)
+        self._record_retirement(op, digest, request, targets, now, descriptor)
+        retired = self._apply_retirement(
+            targets,
+            kind=kind,
+            below=descriptor.get("below"),
+            ceilings=descriptor.get("ceilings"),
+        )
+        record = self.receipt(op)
+        if record is None:
+            raise ContractError("STORAGE_UNAVAILABLE", "deletion_receipt")
+        layers = dict(record["layers"])
+        layers.update(affected_objects=retired, retired=retired)
+        conn = self._tx._check(write=True)
+        conn.execute(
+            "UPDATE deletion_operations SET layers_json=? WHERE operation_id=?",
+            (canonical(layers), op),
+        )
+        result = self.receipt(op)
+        if result is None:
+            raise ContractError("STORAGE_UNAVAILABLE", "deletion_receipt")
+        return dict(result, retired=retired)
 
     def purge_sqlite(self, operation_id: str) -> dict:
         conn = self._tx._check(write=True)

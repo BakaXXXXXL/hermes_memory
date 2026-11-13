@@ -190,10 +190,13 @@ provider unselected, which `doctor` reports as `host_registration_incomplete`
 
 `--agent-id` must equal the `agent_identity` the host sends on `initialize`: the
 adapter compares them and raises `agent_identity conflict` when they differ
-(`adapters/hermes/identity.py`). Hermes sends the name of the profile that owns
-`HERMES_HOME`: `default` for the default home (`%LOCALAPPDATA%\hermes` on
-Windows, `~/.hermes` elsewhere) and for any home outside it, `<name>` for a home
-at `<root>\profiles\<name>`, and `custom` for any other directory inside the
+(`adapters/hermes/identity.py`). An entry of a shared store is the exception:
+every attached profile may send its own name, and the adapter binds the store
+manifest's `agent_id` instead ([shared-store.md](shared-store.md)). For a local
+installation Hermes sends the name of the profile that owns `HERMES_HOME`:
+`default` for the default home (`%LOCALAPPDATA%\hermes` on Windows, `~/.hermes`
+elsewhere) and for any home outside it, `<name>` for a home at
+`<root>\profiles\<name>`, and `custom` for any other directory inside the
 default home. Read it for your home with the Python of Hermes's own environment,
 the one the `hermes` command runs:
 
@@ -844,6 +847,10 @@ until it comes back empty. Without `--apply` it only lists what it would retire,
 by reference, never by text. A retired claim gets a retracted version and stops
 waiting for evaluation; its sources, its earlier versions and every confirmed
 claim stay as they are.
+
+To remove vectors whose SQLite subject is gone, or history vectors as well with
+`--include-history`, use `vector-cleanup`; it is a dry run unless `--apply` names the manifest a
+dry run wrote. See [vector-cleanup.md](vector-cleanup.md).
 
 An earlier release's capture filter left a one-line summary in place of a tool
 output it withheld ("Tool execution summary ... output_preview=omitted"); stores
